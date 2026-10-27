@@ -12,4 +12,4 @@ node packages/coding-agent/dist/bundle/cli.js
 # 直接源代码运行
 npm run pi:dev -- <参数> 就能透传
 npm run pi:dev --mode web
-.\pi-test.bat --mode web 
+.\fly_pi_dev.bat --mode web 

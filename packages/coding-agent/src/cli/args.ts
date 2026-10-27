@@ -12,6 +12,9 @@ export type Mode = "text" | "json" | "rpc" | "web";
 
 export const DEFAULT_WEB_PORT = 3000;
 
+/** URI prefix hosting the web UI (page, assets, and API) so it can share a port with other routes. */
+export const WEB_BASE_PATH = "/fly_pi";
+
 export interface Args {
 	provider?: string;
 	model?: string;
@@ -317,7 +320,7 @@ ${chalk.bold("Options:")}
   --system-prompt <text>         System prompt (default: coding assistant prompt)
   --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
   --mode <mode>                  Output mode: text (default), json, rpc, or web
-  --port <n>                     HTTP port for --mode web (default: ${DEFAULT_WEB_PORT})
+  --port <n>                     HTTP port for --mode web (default: ${DEFAULT_WEB_PORT}, UI at ${WEB_BASE_PATH}/)
   --print, -p                    Non-interactive mode: process prompt and exit
   --continue, -c                 Continue previous session
   --resume, -r                   Select a session to resume
@@ -368,7 +371,7 @@ ${chalk.bold("Examples:")}
   # Print an OAuth bearer token for an external client (refreshes if expired)
   ${APP_NAME} auth print-bearer-token --provider openai-codex
 
-  # Start the local web UI (served on http://127.0.0.1:3000)
+  # Start the local web UI (served on http://127.0.0.1:${DEFAULT_WEB_PORT}${WEB_BASE_PATH}/)
   ${APP_NAME} --mode web
 
   # Interactive mode

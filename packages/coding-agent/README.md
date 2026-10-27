@@ -76,10 +76,10 @@ Clone the repository, install its dependencies, and run Pi from source:
 git clone https://github.com/earendil-works/pi
 cd pi
 npm install --ignore-scripts
-./pi-test.sh
+./fly_pi_dev.sh
 ```
 
-`pi-test.sh` can be called from any directory and preserves the caller's working directory.
+`fly_pi_dev.sh` can be called from any directory and preserves the caller's working directory.
 
 Before submitting changes, run:
 

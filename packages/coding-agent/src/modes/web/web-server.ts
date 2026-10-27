@@ -1,10 +1,16 @@
 /**
  * Web mode: local HTTP server exposing the agent session to a browser UI.
  *
+ * Every route lives under WEB_BASE_PATH ("/fly_pi"), so the UI can sit behind a
+ * path-prefixing reverse proxy without knowing its own prefix: the page and its
+ * assets are relative URLs, and the API paths are relative to the page.
+ *
  * Serves a static HTML/JS/CSS single page (src/modes/web/ui) plus a JSON API:
  * - Chat/session: GET /api/state, GET /api/events (SSE), POST /api/prompt, POST /api/abort,
- *   POST /api/model, POST /api/thinking, POST /api/session/new, GET /api/models
- * - Model configuration: GET/PUT/DELETE /api/config/providers[/:id], backed by models.json
+ *   POST /api/model, POST /api/thinking, POST /api/session/new, POST /api/session/resume
+ *   (by session id), GET /api/sessions, GET /api/models
+ * - Model configuration: GET/PUT/DELETE /api/config/providers[/:id], backed by models.json;
+ *   POST /api/probe tests a provider's reachability and lists its models before saving
  *
  * The server binds to 127.0.0.1 only: the agent can execute local commands, so this
  * must not be exposed to the network without authentication.
@@ -14,11 +20,13 @@ import { existsSync, readFileSync } from "node:fs";
 import * as http from "node:http";
 import { join } from "node:path";
 import { URL } from "node:url";
-import { isValidThinkingLevel } from "../../cli/args.ts";
+import { isValidThinkingLevel, WEB_BASE_PATH } from "../../cli/args.ts";
 import { getWebUiAssetsDir } from "../../config.ts";
 import type { AgentSessionEvent } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import { ModelConfig, saveModelsConfig } from "../../core/model-config.ts";
+import { resolveConfigValueUncached } from "../../core/resolve-config-value.ts";
+import { type SessionInfo, SessionManager } from "../../core/session-manager.ts";
 import { toJsonEvent } from "../json-event.ts";
 
 export interface RunWebModeOptions {
@@ -33,6 +41,8 @@ interface SSEClient {
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const HEARTBEAT_INTERVAL_MS = 30_000;
+/** Sidebar size: session files are read from disk, so cap the list for the browser. */
+const MAX_SESSION_LIST_SIZE = 50;
 
 const STATIC_FILES: Record<string, { file: string; contentType: string }> = {
 	"/": { file: "index.html", contentType: "text/html; charset=utf-8" },
@@ -41,10 +51,197 @@ const STATIC_FILES: Record<string, { file: string; contentType: string }> = {
 	"/style.css": { file: "style.css", contentType: "text/css; charset=utf-8" },
 };
 
+/**
+ * Strip the base path from a request path. Returns the path to route, or undefined
+ * when the request is outside the base (the caller answers 404, or redirects the bare
+ * base so `http://host:port/` still lands on the UI).
+ */
+function stripBasePath(pathname: string): string | undefined {
+	if (!pathname.startsWith(`${WEB_BASE_PATH}/`)) return undefined;
+	return pathname.slice(WEB_BASE_PATH.length);
+}
+
+/** Session handle plus the metadata the sidebar needs; the transcript stays on the server. */
+function toSessionSummary(info: SessionInfo): Record<string, unknown> {
+	return {
+		id: info.id,
+		name: info.name,
+		cwd: info.cwd,
+		created: info.created.toISOString(),
+		modified: info.modified.toISOString(),
+		messageCount: info.messageCount,
+		firstMessage: info.firstMessage.slice(0, 120),
+	};
+}
+
 /** Strip credential-bearing fields before model/session data crosses the HTTP boundary. */
 function toSafeModel(model: unknown): Record<string, unknown> {
 	const { headers: _headers, ...rest } = model as Record<string, unknown>;
 	return rest;
+}
+
+/** Model fields the browser needs to pick and display a model; drops cost/compat/sampling noise. */
+function toPickerModel(model: Record<string, unknown>): Record<string, unknown> {
+	return {
+		id: model.id,
+		provider: model.provider,
+		name: model.name,
+		api: model.api,
+		reasoning: model.reasoning,
+		input: model.input,
+		contextWindow: model.contextWindow,
+		maxTokens: model.maxTokens,
+	};
+}
+
+/**
+ * models.json can pass its JSON-schema check and still be unusable: provider-composer throws for a
+ * custom model with no `api` (and no built-in provider to inherit one from) or no `baseUrl`, and one
+ * bad provider empties the *whole* available-model list, which leaves the session on the placeholder
+ * model and makes every prompt fail with "No API key found for the selected model". Reject it here
+ * with an actionable message instead of persisting a config that breaks chat.
+ */
+function validateProviderComposition(
+	providerId: string,
+	provider: Record<string, unknown>,
+	hasBuiltInProvider: boolean,
+): string | undefined {
+	const models = Array.isArray(provider.models) ? (provider.models as Record<string, unknown>[]) : [];
+	for (const model of models) {
+		const modelId = typeof model.id === "string" ? model.id : "(missing id)";
+		const api = model.api ?? provider.api;
+		if (!api && !hasBuiltInProvider) {
+			return (
+				`Provider "${providerId}", model "${modelId}": 必须选择 API 类型（例如 openai-completions）。` +
+				"未设置会导致所有模型都无法使用。"
+			);
+		}
+		const baseUrl = model.baseUrl ?? provider.baseUrl;
+		if (!baseUrl && !hasBuiltInProvider) {
+			return `Provider "${providerId}", model "${modelId}": 必须填写 Base URL。`;
+		}
+	}
+	return undefined;
+}
+
+const PROBE_TIMEOUT_MS = 15_000;
+
+/** Auth headers matching provider-composer conventions for a probe request. */
+function probeAuthHeaders(
+	api: string | undefined,
+	key: string | undefined,
+	authHeader: boolean,
+): Record<string, string> {
+	if (!key) return {};
+	if (api === "anthropic-messages") return { "x-api-key": key, "anthropic-version": "2023-06-01" };
+	if (api === "google-generative-ai") return { "x-goog-api-key": key };
+	if (authHeader || !api || api.startsWith("openai") || api === "openai-completions" || api === "openai-responses") {
+		return { Authorization: `Bearer ${key}` };
+	}
+	return {};
+}
+
+/** Parse common model-list response shapes (OpenAI-style arrays under data/models, or a bare array). */
+function parseProbeModels(payload: unknown): { id: string; name?: string }[] {
+	let entries: unknown[] = [];
+	if (Array.isArray(payload)) entries = payload;
+	else if (payload && typeof payload === "object") {
+		const obj = payload as Record<string, unknown>;
+		for (const field of ["data", "models", "models_list"]) {
+			if (Array.isArray(obj[field])) {
+				entries = obj[field] as unknown[];
+				break;
+			}
+		}
+	}
+	const models: { id: string; name?: string }[] = [];
+	const seen = new Set<string>();
+	for (const entry of entries) {
+		const id =
+			typeof entry === "string"
+				? entry
+				: typeof (entry as Record<string, unknown>)?.id === "string"
+					? ((entry as Record<string, unknown>).id as string)
+					: undefined;
+		if (!id || seen.has(id)) continue;
+		seen.add(id);
+		const name = typeof entry === "object" && entry !== null ? (entry as Record<string, unknown>).name : undefined;
+		models.push({ id, name: typeof name === "string" ? name : undefined });
+	}
+	return models;
+}
+
+/**
+ * Probe a provider endpoint without persisting anything: GET <baseUrl>/models with the
+ * candidate credentials. Non-2xx responses still prove the server answered (reachable).
+ */
+async function probeProvider(input: {
+	baseUrl: string;
+	apiKey?: string;
+	api?: string;
+	headers?: Record<string, string>;
+	authHeader?: boolean;
+}): Promise<{
+	reachable: boolean;
+	status: number;
+	listSupported: boolean;
+	models: { id: string; name?: string }[];
+	message?: string;
+}> {
+	const key = input.apiKey !== undefined ? resolveConfigValueUncached(input.apiKey) : undefined;
+	if (input.apiKey !== undefined && key === undefined) {
+		throw Object.assign(new Error(`Failed to resolve API key: ${input.apiKey}`), { statusCode: 400 });
+	}
+	let url: string;
+	try {
+		url = new URL("models", `${input.baseUrl.replace(/\/+$/, "")}/`).toString();
+	} catch {
+		throw Object.assign(new Error(`Invalid Base URL: ${input.baseUrl}`), { statusCode: 400 });
+	}
+	const headers: Record<string, string> = {
+		Accept: "application/json",
+		...input.headers,
+		...probeAuthHeaders(input.api, key, input.authHeader === true),
+	};
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+	let response: Response;
+	try {
+		response = await fetch(url, { method: "GET", headers, signal: controller.signal });
+	} catch (error) {
+		const reason =
+			error instanceof Error && error.name === "AbortError"
+				? `请求超时（${PROBE_TIMEOUT_MS / 1000}s）`
+				: error instanceof Error
+					? error.message
+					: String(error);
+		return { reachable: false, status: 0, listSupported: false, models: [], message: `服务器不可达: ${reason}` };
+	} finally {
+		clearTimeout(timeout);
+	}
+	if (!response.ok) {
+		const body = (await response.text()).slice(0, 300);
+		return {
+			reachable: true,
+			status: response.status,
+			listSupported: false,
+			models: [],
+			message: `服务器已响应 (HTTP ${response.status})${body ? `: ${body}` : ""}`,
+		};
+	}
+	let payload: unknown;
+	try {
+		payload = await response.json();
+	} catch {
+		return {
+			reachable: true,
+			status: response.status,
+			listSupported: false,
+			models: [],
+			message: `服务器已响应 (HTTP ${response.status})，但模型列表不是有效 JSON`,
+		};
+	}
+	return { reachable: true, status: response.status, listSupported: true, models: parseProbeModels(payload) };
 }
 
 function buildStatePayload(session: AgentSessionRuntime["session"]): Record<string, unknown> {
@@ -54,6 +251,7 @@ function buildStatePayload(session: AgentSessionRuntime["session"]): Record<stri
 		availableThinkingLevels: session.getAvailableThinkingLevels(),
 		isStreaming: session.isStreaming,
 		isCompacting: session.isCompacting,
+		sessionId: session.sessionManager.getSessionId(),
 		sessionFile: session.sessionFile,
 		sessionName: session.sessionName,
 		tools: session.getActiveToolNames(),
@@ -157,6 +355,28 @@ export async function runWebMode(runtime: AgentSessionRuntime, options: RunWebMo
 		await runtime.session.modelRuntime.refresh({ allowNetwork: false });
 	};
 
+	/**
+	 * A saved config can leave the session on the placeholder model (no available models, or the
+	 * restored model disappeared). Pick the first available model so the next prompt can run;
+	 * a model the session is already using is never touched.
+	 */
+	const ensureUsableModel = async (): Promise<{ id: string; provider: string } | undefined> => {
+		const session = runtime.session;
+		const available = session.modelRuntime.getAvailableSnapshot();
+		if (available.length === 0) return undefined;
+		const current = session.model;
+		if (current && available.some((m) => m.provider === current.provider && m.id === current.id)) {
+			return undefined;
+		}
+		const picked = available[0];
+		try {
+			await session.setModel(picked, { persist: true });
+		} catch {
+			return undefined;
+		}
+		return { id: picked.id, provider: picked.provider };
+	};
+
 	const sendJson = (res: http.ServerResponse, status: number, payload: unknown) => {
 		const body = JSON.stringify(payload);
 		res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
@@ -189,8 +409,7 @@ export async function runWebMode(runtime: AgentSessionRuntime, options: RunWebMo
 		}
 	};
 
-	const handleApi = async (req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<void> => {
-		const path = url.pathname;
+	const handleApi = async (req: http.IncomingMessage, res: http.ServerResponse, path: string): Promise<void> => {
 		const method = req.method ?? "GET";
 
 		if (method === "GET" && path === "/api/state") {
@@ -214,6 +433,18 @@ export async function runWebMode(runtime: AgentSessionRuntime, options: RunWebMo
 			return;
 		}
 
+		if (method === "GET" && path === "/api/sessions") {
+			const dir = session.sessionManager.getSessionDir();
+			// An in-memory session has no session directory (and nothing to resume).
+			const sessions = dir ? await SessionManager.list(session.sessionManager.getCwd(), dir) : [];
+			sendJson(res, 200, {
+				sessions: sessions.slice(0, MAX_SESSION_LIST_SIZE).map(toSessionSummary),
+				sessionDir: dir,
+				currentSessionId: session.sessionManager.getSessionId(),
+			});
+			return;
+		}
+
 		if (method === "GET" && path === "/api/models") {
 			const modelRuntime = session.modelRuntime;
 			const available = new Set(modelRuntime.getAvailableSnapshot().map((m) => `${m.provider}/${m.id}`));
@@ -222,7 +453,7 @@ export async function runWebMode(runtime: AgentSessionRuntime, options: RunWebMo
 				if (!providers[model.provider]) {
 					providers[model.provider] = { auth: modelRuntime.getProviderAuthStatus(model.provider) };
 				}
-				return toSafeModel(model);
+				return toPickerModel(toSafeModel(model));
 			});
 			sendJson(res, 200, {
 				models,
@@ -244,6 +475,36 @@ export async function runWebMode(runtime: AgentSessionRuntime, options: RunWebMo
 			return;
 		}
 
+		if (method === "POST" && path === "/api/probe") {
+			const body = await readJsonBody(req, res);
+			if (body === undefined) return;
+			const baseUrl = typeof body.baseUrl === "string" ? body.baseUrl.trim() : "";
+			if (!baseUrl) {
+				sendError(res, 400, "Missing required field: baseUrl");
+				return;
+			}
+			const rawHeaders =
+				body.headers && typeof body.headers === "object" ? (body.headers as Record<string, unknown>) : {};
+			const headers: Record<string, string> = {};
+			for (const [k, v] of Object.entries(rawHeaders)) {
+				if (typeof v === "string") headers[k] = v;
+			}
+			try {
+				const result = await probeProvider({
+					baseUrl,
+					apiKey: typeof body.apiKey === "string" && body.apiKey.trim() ? body.apiKey.trim() : undefined,
+					api: typeof body.api === "string" && body.api ? body.api : undefined,
+					headers: Object.keys(headers).length > 0 ? headers : undefined,
+					authHeader: body.authHeader === true,
+				});
+				sendJson(res, 200, result);
+			} catch (error) {
+				const err = error as Error & { statusCode?: number };
+				sendError(res, err.statusCode ?? 500, err.message);
+			}
+			return;
+		}
+
 		const providerMatch = path.match(/^\/api\/config\/providers\/([^/]+)$/);
 		if (providerMatch && (method === "PUT" || method === "DELETE")) {
 			const providerId = decodeURIComponent(providerMatch[1]);
@@ -255,11 +516,18 @@ export async function runWebMode(runtime: AgentSessionRuntime, options: RunWebMo
 				sendError(res, err.statusCode ?? 500, err.message);
 				return;
 			}
-			const providers = current.providers;
+			const providers = structuredClone(current.providers);
+			let compositionError: string | undefined;
 			if (method === "PUT") {
 				const body = await readJsonBody(req, res);
 				if (body === undefined) return;
-				const providerConfig = body.config ?? body;
+				const providerConfig = (body.config ?? body) as Record<string, unknown>;
+				// Captured before writing: after the write the provider exists in the registry.
+				compositionError = validateProviderComposition(
+					providerId,
+					providerConfig,
+					session.modelRuntime.getProvider(providerId) !== undefined,
+				);
 				providers[providerId] = providerConfig;
 			} else {
 				if (providers[providerId] === undefined) {
@@ -274,8 +542,20 @@ export async function runWebMode(runtime: AgentSessionRuntime, options: RunWebMo
 				sendError(res, 400, error instanceof Error ? error.message : String(error));
 				return;
 			}
+			// Schema-valid but uncompusable: roll back so one bad provider cannot take the whole
+			// model list (and therefore every chat) down with it.
+			if (compositionError) {
+				await writeModelsConfig(structuredClone(current.providers)).catch(() => undefined);
+				sendError(res, 400, compositionError);
+				return;
+			}
+			const selectedModel = method === "PUT" ? await ensureUsableModel() : undefined;
 			const updated = await loadModelsConfigOrThrow();
-			sendJson(res, 200, { providers: updated.providers });
+			sendJson(res, 200, {
+				providers: updated.providers,
+				runtimeError: session.modelRuntime.getError(),
+				selectedModel,
+			});
 			return;
 		}
 
@@ -293,6 +573,18 @@ export async function runWebMode(runtime: AgentSessionRuntime, options: RunWebMo
 					if (!session.isIdle) {
 						const disposition = await session.steer(text, undefined, { source: "rpc" });
 						sendJson(res, 200, { disposition });
+						return;
+					}
+					// Fail fast with an actionable hint instead of a 202 whose only feedback is a
+					// transient "No API key found for the selected model" error event.
+					const model = session.model;
+					const usable =
+						model !== undefined &&
+						session.modelRuntime
+							.getAvailableSnapshot()
+							.some((available) => available.provider === model.provider && available.id === model.id);
+					if (!usable) {
+						sendError(res, 409, "当前没有可用模型。请在「模型设置」中配置 Provider 并保存，或在顶部选择模型。");
 						return;
 					}
 					void session.prompt(text, { source: "rpc" }).catch((error: unknown) => {
@@ -338,6 +630,30 @@ export async function runWebMode(runtime: AgentSessionRuntime, options: RunWebMo
 					sendJson(res, 200, { cancelled: result.cancelled });
 					return;
 				}
+				case "/api/session/resume": {
+					const sessionId = typeof body.sessionId === "string" ? body.sessionId.trim() : "";
+					if (!sessionId) {
+						sendError(res, 400, "Missing required field: sessionId");
+						return;
+					}
+					if (sessionId === session.sessionManager.getSessionId()) {
+						sendJson(res, 200, { cancelled: false, sessionId, sessionFile: session.sessionFile });
+						return;
+					}
+					// The browser addresses sessions by id only: the server resolves the file inside its
+					// own session directory, so a request cannot name an arbitrary jsonl path.
+					const sessionDir = session.sessionManager.getSessionDir();
+					const found = sessionDir
+						? SessionManager.findById(session.sessionManager.getCwd(), sessionId, sessionDir)
+						: undefined;
+					if (!found) {
+						sendError(res, 404, `未找到已保存的会话: ${sessionId}`);
+						return;
+					}
+					const result = await runtime.switchSession(found);
+					sendJson(res, 200, { cancelled: result.cancelled, sessionId, sessionFile: found });
+					return;
+				}
 				default: {
 					sendError(res, 404, `Unknown endpoint: ${path}`);
 					return;
@@ -365,7 +681,17 @@ export async function runWebMode(runtime: AgentSessionRuntime, options: RunWebMo
 
 	const server = http.createServer((req, res) => {
 		const url = new URL(req.url ?? "/", "http://127.0.0.1");
-		handleApi(req, res, url).catch((error: unknown) => {
+		const path = stripBasePath(url.pathname);
+		if (path === undefined) {
+			if (url.pathname === "/" || url.pathname === WEB_BASE_PATH) {
+				res.writeHead(302, { Location: `${WEB_BASE_PATH}/` });
+				res.end();
+				return;
+			}
+			sendError(res, 404, `Not found: ${req.method ?? "GET"} ${url.pathname}`);
+			return;
+		}
+		handleApi(req, res, path).catch((error: unknown) => {
 			if (!res.headersSent) {
 				sendError(res, 500, error instanceof Error ? error.message : String(error));
 			} else {
@@ -389,6 +715,6 @@ export async function runWebMode(runtime: AgentSessionRuntime, options: RunWebMo
 
 	const address = server.address();
 	const port = typeof address === "object" && address !== null ? address.port : options.port;
-	console.log(`Web UI available at http://127.0.0.1:${port}`);
+	console.log(`Web UI available at http://127.0.0.1:${port}${WEB_BASE_PATH}/`);
 	return server;
 }

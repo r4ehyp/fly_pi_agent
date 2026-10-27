@@ -1,6 +1,18 @@
 "use strict";
 
+// Vanilla single-page client for `pi --mode web`. No build step, no framework:
+// server state comes from GET <base>/api/state, live updates from the <base>/api/events SSE
+// stream. The whole app is hosted under a path prefix (/fly_pi/), so every request is built
+// from the page URL instead of a hardcoded root path.
+
 // ---- helpers ----------------------------------------------------------------
+
+/** "/fly_pi" when the page is served from "/fly_pi/", "" when it is served from the root. */
+const UI_BASE = new URL(".", window.location.href).pathname.replace(/\/$/, "");
+
+function withBase(path) {
+	return `${UI_BASE}${path}`;
+}
 
 function $(id) {
 	return document.getElementById(id);
@@ -12,6 +24,20 @@ function escapeHtml(text) {
 		.replace(/</g, "&lt;")
 		.replace(/>/g, "&gt;")
 		.replace(/"/g, "&quot;");
+}
+
+function el(tag, className, textContent) {
+	const node = document.createElement(tag);
+	if (className) node.className = className;
+	if (textContent !== undefined) node.textContent = textContent;
+	return node;
+}
+
+function fmtTokens(n) {
+	if (!Number.isFinite(n)) return "-";
+	if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M`;
+	if (n >= 1000) return `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k`;
+	return String(n);
 }
 
 /** Minimal markdown renderer: fenced code, inline code, bold, headings, lists, links. */
@@ -66,10 +92,9 @@ function renderMarkdown(text) {
 			out.push(`<li>${inline(bullet[1])}</li>`);
 		} else if (line.trim() === "") {
 			closeList();
-			out.push("<br>");
 		} else {
 			closeList();
-			out.push(`<div>${inline(line)}</div>`);
+			out.push(`<p>${inline(line)}</p>`);
 		}
 	}
 	if (inCode) out.push(`<pre><code>${codeBuf.join("\n")}</code></pre>`);
@@ -77,15 +102,29 @@ function renderMarkdown(text) {
 	return out.join("");
 }
 
-function el(tag, className, textContent) {
-	const node = document.createElement(tag);
-	if (className) node.className = className;
-	if (textContent !== undefined) node.textContent = textContent;
-	return node;
+/** Adds a hover "copy" button to every fenced block. Runs on the nodes we just built. */
+function decorateCodeBlocks(root) {
+	for (const pre of root.querySelectorAll("pre")) {
+		const btn = el("button", "copy-btn", "复制");
+		btn.type = "button";
+		btn.addEventListener("click", () => {
+			const code = pre.querySelector("code")?.textContent ?? "";
+			navigator.clipboard
+				?.writeText(code)
+				.then(() => {
+					btn.textContent = "已复制";
+					setTimeout(() => {
+						btn.textContent = "复制";
+					}, 1200);
+				})
+				.catch(() => toast("复制失败", true));
+		});
+		pre.appendChild(btn);
+	}
 }
 
-function detailsBlock(summaryText, contentNodes, open) {
-	const details = el("details", "block");
+function detailsBlock(summaryText, contentNodes, open, extraClass) {
+	const details = el("details", `block${extraClass ? ` ${extraClass}` : ""}`);
 	if (open) details.open = true;
 	const summary = el("summary");
 	summary.textContent = summaryText;
@@ -95,7 +134,7 @@ function detailsBlock(summaryText, contentNodes, open) {
 }
 
 async function api(path, options) {
-	const res = await fetch(path, options);
+	const res = await fetch(withBase(path), options);
 	let payload = null;
 	try {
 		payload = await res.json();
@@ -120,20 +159,35 @@ function toast(message, isError) {
 	clearTimeout(toast.timer);
 	toast.timer = setTimeout(() => {
 		node.hidden = true;
-	}, 3500);
+	}, 4000);
 }
 
 // ---- chat state --------------------------------------------------------------
 
 let busy = false;
 let currentModelKey = null; // "provider/id"
+let currentContextWindow = 0;
+let lastContextTokens = 0;
 const messagesEl = $("messages");
-const streamingByMessageRole = new Map(); // one live assistant bubble
+const toolBlocksById = new Map(); // toolCallId -> <details>, updated when the result arrives
+const toolTimingById = new Map(); // toolCallId -> { ms, isError }; survives the post-turn re-render
+
+function modelKey(model) {
+	return model ? `${model.provider}/${model.id}` : null;
+}
 
 function setBusy(value) {
 	busy = value;
 	$("stop-btn").disabled = !busy;
-	$("status-line").textContent = busy ? "运行中…" : "";
+	$("send-btn").disabled = busy || !hasUsableModel();
+	const status = $("status-line");
+	status.classList.toggle("busy", value);
+	status.textContent = value ? "正在思考 / 执行工具…" : "";
+}
+
+function hasUsableModel() {
+	if (!currentModelKey || !modelsPayload) return false;
+	return modelsPayload.available.includes(currentModelKey);
 }
 
 function messageTextContent(content) {
@@ -145,75 +199,150 @@ function messageTextContent(content) {
 		.join("\n");
 }
 
-function renderToolCallBlock(toolCall, result) {
-	const nodes = [el("pre", undefined, `参数:\n${JSON.stringify(toolCall.arguments ?? toolCall.partialArguments, null, 2)}`)];
-	if (result !== undefined) {
-		const resultText = messageTextContent(result.content) || JSON.stringify(result.content);
-		nodes.push(el("pre", undefined, `${result.isError ? "错误输出" : "结果"}:\n${resultText}`));
-	}
-	return detailsBlock(`工具调用: ${toolCall.name || toolCall.toolName || "(流式)"}`, nodes);
+function toolStateText(ms, isError) {
+	if (ms === undefined) return isError ? "失败" : "完成";
+	return `${isError ? "失败" : "完成"} ${Math.round(ms)}ms`;
 }
 
-function renderAssistantBody(message) {
+function applyToolState(card, { ms, isError }) {
+	const state = card.querySelector(".state");
+	if (!state) return;
+	state.className = `state ${isError ? "bad" : "ok"}`;
+	state.textContent = toolStateText(ms, isError);
+	card.classList.toggle("bad", Boolean(isError));
+}
+
+function toolCard(toolCall, result) {
+	const id = toolCall.id || toolCall.toolCallId || "";
+	const name = toolCall.name || toolCall.toolName || "tool";
+	const nodes = [el("pre", undefined, JSON.stringify(toolCall.arguments ?? toolCall.partialArguments ?? {}, null, 2))];
+	if (result !== undefined) nodes.push(resultNode(result));
+	const details = detailsBlock("", nodes, false, "tool");
+	const summary = details.querySelector("summary");
+	summary.append(el("span", "kind", name), el("span", "state", ""));
+	if (id) {
+		details.dataset.toolCallId = id;
+		toolBlocksById.set(id, details);
+	}
+	const timing = id ? toolTimingById.get(id) : undefined;
+	if (timing) applyToolState(details, timing);
+	else if (result !== undefined) applyToolState(details, { ms: undefined, isError: Boolean(result.isError) });
+	else {
+		const state = details.querySelector(".state");
+		state.className = "state running";
+		state.textContent = "执行中…";
+	}
+	return details;
+}
+
+function resultNode(result) {
+	const text = messageTextContent(result.content) || JSON.stringify(result.content, null, 2);
+	return el("pre", undefined, `${result.isError ? "错误输出" : "结果"}:\n${text}`);
+}
+
+function usageLine(message) {
+	const usage = message.usage;
+	if (!usage) return null;
+	const parts = [];
+	const prompt = (usage.input || 0) + (usage.cacheRead || 0) + (usage.cacheWrite || 0);
+	if (prompt) parts.push(`输入 ${fmtTokens(prompt)}`);
+	if (usage.output) parts.push(`输出 ${fmtTokens(usage.output)}`);
+	if (usage.cost && usage.cost.total) parts.push(`费用 $${usage.cost.total.toFixed(4)}`);
+	if (parts.length === 0) return null;
+	return el("span", "num", parts.join(" · "));
+}
+
+function assistantBody(message) {
 	const frag = el("div", "markdown");
 	for (const part of message.content || []) {
 		if (part.type === "text") {
 			const div = el("div");
 			div.innerHTML = renderMarkdown(part.text);
+			// Decorate only this text block: tool cards are reused across streaming redraws and
+			// would otherwise accumulate a copy button per delta.
+			decorateCodeBlocks(div);
 			frag.appendChild(div);
 		} else if (part.type === "thinking") {
-			frag.appendChild(detailsBlock("思考过程", [el("pre", undefined, part.thinking || part.text || "")]));
+			frag.appendChild(detailsBlock("思考过程", [el("pre", undefined, part.thinking || part.text || "")], false, "thinking"));
 		} else if (part.type === "toolCall" || part.type === "toolcall") {
-			frag.appendChild(renderToolCallBlock(part));
+			const id = part.id || "";
+			const existing = toolBlocksById.get(id);
+			if (existing) frag.appendChild(existing);
+			else frag.appendChild(toolCard(part, undefined));
 		}
-	}
-	if ((message.stopReason === "error" || message.stopReason === "aborted") && message.errorMessage) {
-		frag.appendChild(el("div", "msg error", `错误: ${message.errorMessage}`));
 	}
 	return frag;
 }
 
-function renderMessage(msg) {
+function messageNode(msg) {
 	if (msg.role === "user") {
 		const node = el("div", "msg user");
-		node.appendChild(el("div", "role", "用户"));
-		const body = el("div", "markdown");
-		body.innerHTML = renderMarkdown(messageTextContent(msg.content));
+		node.appendChild(el("div", "avatar", "你"));
+		const body = el("div", "body");
+		const bubble = el("div", "bubble");
+		const inner = el("div", "markdown");
+		inner.innerHTML = renderMarkdown(messageTextContent(msg.content));
+		bubble.appendChild(inner);
+		body.appendChild(bubble);
 		node.appendChild(body);
 		return node;
 	}
 	if (msg.role === "assistant") {
 		const node = el("div", "msg assistant");
-		node.appendChild(el("div", "role", `助手 ${msg.provider ? msg.provider + "/" : ""}${msg.model || ""}`));
-		node.appendChild(renderAssistantBody(msg));
-		node.dataset.provider = msg.provider || "";
-		node.dataset.model = msg.model || "";
+		node.appendChild(el("div", "avatar", "AI"));
+		const body = el("div", "body");
+		const meta = el("div", "meta");
+		meta.appendChild(el("span", "who", "助手"));
+		if (msg.model) meta.appendChild(el("span", undefined, `${msg.provider ? `${msg.provider} · ` : ""}${msg.model}`));
+		const usage = usageLine(msg);
+		if (usage) meta.appendChild(usage);
+		body.appendChild(meta);
+		const bubble = el("div", "bubble");
+		bubble.appendChild(assistantBody(msg));
+		if ((msg.stopReason === "error" || msg.stopReason === "aborted") && msg.errorMessage) {
+			bubble.appendChild(el("div", "error-text", `错误: ${msg.errorMessage}`));
+			node.classList.add("error");
+		}
+		body.appendChild(bubble);
+		node.appendChild(body);
 		return node;
 	}
+	// Tool results attach to their tool card when one is on screen.
 	if (msg.role === "toolResult") {
-		const node = el("div", "msg toolresult");
-		const text = messageTextContent(msg.content);
-		node.appendChild(
-			detailsBlock(`工具结果: ${msg.toolName || ""}${msg.isError ? " (错误)" : ""}`, [el("pre", undefined, text)], text.length < 400),
-		);
-		node.dataset.toolCallId = msg.toolCallId || "";
+		const card = toolBlocksById.get(msg.toolCallId);
+		if (card) {
+			card.appendChild(resultNode(msg));
+			const timing = toolTimingById.get(msg.toolCallId);
+			applyToolState(card, { ms: timing && timing.ms, isError: Boolean(msg.isError) });
+			return null;
+		}
+		const node = el("div", "msg assistant");
+		node.appendChild(el("div", "avatar", "T"));
+		const body = el("div", "body");
+		const details = detailsBlock(`工具结果: ${msg.toolName || ""}`, [resultNode(msg)], false, "tool");
+		body.appendChild(details);
+		node.appendChild(body);
 		return node;
 	}
-	// Other session entry messages (branch summaries etc.): show text only.
 	const node = el("div", "msg assistant");
-	node.appendChild(el("div", "role", msg.role || "消息"));
-	node.appendChild(el("div", undefined, messageTextContent(msg.content)));
+	node.appendChild(el("div", "avatar", "·"));
+	const body = el("div", "body");
+	const bubble = el("div", "bubble");
+	bubble.appendChild(el("div", "meta", msg.role || "消息"));
+	bubble.appendChild(el("div", undefined, messageTextContent(msg.content)));
+	body.appendChild(bubble);
+	node.appendChild(body);
 	return node;
 }
 
-function renderTranscript(messages) {
-	messagesEl.innerHTML = "";
-	streamingByMessageRole.clear();
-	for (const msg of messages) {
-		if (msg.role === "system") continue;
-		messagesEl.appendChild(renderMessage(msg));
-	}
-	scrollToBottom();
+function appendMessage(msg) {
+	const node = messageNode(msg);
+	if (!node) return;
+	const chat = $("chat");
+	const stuckToBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 120;
+	hideEmptyState();
+	messagesEl.appendChild(node);
+	if (stuckToBottom) scrollToBottom();
 }
 
 function scrollToBottom() {
@@ -221,12 +350,126 @@ function scrollToBottom() {
 	chat.scrollTop = chat.scrollHeight;
 }
 
+// ---- empty state -------------------------------------------------------------
+
+function renderEmptyState() {
+	const box = el("div", "empty-state");
+	box.id = "empty-state";
+	box.appendChild(el("h2", undefined, "开始使用 Pi Agent"));
+	const list = el("ol");
+	const configured = hasUsableModel();
+	const step1 = el("li", configured ? "done" : undefined, configured ? "已配置可用模型" : "尚未配置可用模型，请在「模型设置」中添加 Provider");
+	const step2 = el("li", undefined, "在顶部选择模型和思考级别");
+	const step3 = el("li", undefined, "在下方输入消息开始对话");
+	list.append(step1, step2, step3);
+	box.appendChild(list);
+	if (!configured) {
+		const btn = el("button", "primary", "打开模型设置");
+		btn.type = "button";
+		btn.addEventListener("click", openSettings);
+		box.appendChild(btn);
+	}
+	messagesEl.appendChild(box);
+}
+
+function hideEmptyState() {
+	const box = $("empty-state");
+	if (box) box.remove();
+}
+
+function maybeShowEmptyState() {
+	if (!messagesEl.querySelector(".msg")) {
+		hideEmptyState();
+		renderEmptyState();
+	}
+}
+
+// ---- alert bar ---------------------------------------------------------------
+
+let alertDismissed = false;
+
+function updateAlert() {
+	const bar = $("alert-bar");
+	if (modelsPayload && modelsPayload.error) {
+		bar.hidden = false;
+		bar.className = "error";
+		$("alert-text").textContent = `模型配置错误：${modelsPayload.error}`;
+		$("alert-action").hidden = false;
+		return;
+	}
+	if (!hasUsableModel()) {
+		if (alertDismissed) {
+			bar.hidden = true;
+			return;
+		}
+		bar.hidden = false;
+		bar.className = "";
+		$("alert-text").textContent = "当前没有可用模型，无法开始对话。请先配置 Provider 并在顶部选择模型。";
+		$("alert-action").hidden = false;
+		return;
+	}
+	bar.hidden = true;
+}
+
+$("alert-action").addEventListener("click", openSettings);
+$("alert-close").addEventListener("click", () => {
+	alertDismissed = true;
+	updateAlert();
+});
+
+// ---- state + models ----------------------------------------------------------
+
+function updateUsage() {
+	const box = $("usage");
+	if (!currentContextWindow) {
+		box.hidden = true;
+		return;
+	}
+	box.hidden = false;
+	box.innerHTML = "";
+	box.appendChild(el("span", undefined, `上下文 ${fmtTokens(lastContextTokens)} / ${fmtTokens(currentContextWindow)}`));
+	const meter = el("span", "meter");
+	const fill = el("i");
+	fill.style.width = `${Math.min(100, (lastContextTokens / currentContextWindow) * 100).toFixed(1)}%`;
+	meter.appendChild(fill);
+	box.appendChild(meter);
+}
+
 function applyState(state) {
 	setBusy(state.isStreaming);
-	renderTranscript(state.messages || []);
-	currentModelKey = state.model ? `${state.model.provider}/${state.model.id}` : null;
+	currentModelKey = modelKey(state.model);
+	currentSessionId = state.sessionId || null;
+	currentSessionFile = state.sessionFile || null;
+	currentSessionName = state.sessionName || null;
+	syncSessionUrl(screenSessionHandle());
+	renderSessionList();
+	currentContextWindow = state.model && state.model.id !== "unknown" ? state.model.contextWindow || 0 : 0;
 	populateThinkingSelect(state.availableThinkingLevels || [], state.thinkingLevel);
+	renderTranscript(state.messages || []);
 	if (modelsPayload) populateModelSelect();
+	updateAlert();
+	updateComposer();
+	updateUsage();
+}
+
+function renderTranscript(messages) {
+	const chat = $("chat");
+	const wasAtBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 120;
+	const previousScrollTop = chat.scrollTop;
+	messagesEl.innerHTML = "";
+	toolBlocksById.clear();
+	lastContextTokens = 0;
+	for (const msg of messages) {
+		if (msg.role === "system") continue;
+		if (msg.role === "assistant" && msg.usage) {
+			lastContextTokens = (msg.usage.input || 0) + (msg.usage.cacheRead || 0) + (msg.usage.cacheWrite || 0);
+		}
+		const node = messageNode(msg);
+		if (node) messagesEl.appendChild(node);
+	}
+	maybeShowEmptyState();
+	// A full re-render must not throw away where the user was reading.
+	chat.scrollTop = wasAtBottom ? chat.scrollHeight : previousScrollTop;
 }
 
 async function refreshState() {
@@ -234,49 +477,89 @@ async function refreshState() {
 	applyState(state);
 }
 
+async function loadModels() {
+	try {
+		modelsPayload = await api("/api/models");
+	} catch (error) {
+		toast(`加载模型失败: ${error.message}`, true);
+		return;
+	}
+	populateModelSelect();
+	updateAlert();
+	updateComposer();
+	maybeShowEmptyState();
+}
+
+function updateComposer() {
+	const usable = hasUsableModel();
+	$("input").disabled = !usable;
+	$("send-btn").disabled = !usable || busy;
+	$("composer-box").classList.toggle("disabled", !usable);
+	$("composer-hint").textContent = usable ? "" : "需先配置并选择模型";
+}
+
 // ---- streaming events --------------------------------------------------------
 
-let liveAssistantEl = null;
+let liveNode = null;
 let liveMessage = null;
 
 function ensureLiveBubble() {
-	if (liveAssistantEl) return;
-	liveAssistantEl = el("div", "msg assistant");
-	liveAssistantEl.appendChild(el("div", "role", "助手 (流式)"));
-	liveAssistantEl._body = el("div", "markdown");
-	liveAssistantEl.appendChild(liveAssistantEl._body);
-	messagesEl.appendChild(liveAssistantEl);
+	if (liveNode) return;
+	hideEmptyState();
+	liveNode = el("div", "msg assistant");
+	liveNode.appendChild(el("div", "avatar", "AI"));
+	const body = el("div", "body");
+	const meta = el("div", "meta");
+	meta.appendChild(el("span", "who", "助手"));
+	meta.appendChild(el("span", undefined, "生成中…"));
+	body.appendChild(meta);
+	const bubble = el("div", "bubble");
+	bubble._body = el("div", "markdown cursor");
+	bubble.appendChild(bubble._body);
+	body.appendChild(bubble);
+	liveNode.appendChild(body);
+	messagesEl.appendChild(liveNode);
 	scrollToBottom();
 }
 
 function rebuildLiveBody() {
-	if (!liveAssistantEl || !liveMessage) return;
-	liveAssistantEl._body.innerHTML = "";
-	for (const part of liveMessage.content) {
-		if (part.type === "text") {
-			const div = el("div");
-			div.innerHTML = renderMarkdown(part.text);
-			liveAssistantEl._body.appendChild(div);
-		} else if (part.type === "thinking") {
-			liveAssistantEl._body.appendChild(detailsBlock("思考过程", [el("pre", undefined, part.thinking || "")]));
-		} else if (part.type === "toolCall") {
-			liveAssistantEl._body.appendChild(renderToolCallBlock(part));
-		}
-	}
-	scrollToBottom();
+	if (!liveNode || !liveMessage) return;
+	const body = liveNode.querySelector(".cursor");
+	const frag = assistantBody({ content: liveMessage.content });
+	body.innerHTML = "";
+	// Move, never iterate a live collection while appending: children shift index as they move.
+	while (frag.firstChild) body.appendChild(frag.firstChild);
+	scheduleScroll();
+}
+
+let scrollQueued = false;
+
+/** Streaming redraws on every delta; scroll at most once per frame. */
+function scheduleScroll() {
+	if (scrollQueued) return;
+	scrollQueued = true;
+	requestAnimationFrame(() => {
+		scrollQueued = false;
+		scrollToBottom();
+	});
 }
 
 function handleEvent(event) {
 	switch (event.type) {
 		case "hello":
-			currentModelKey = event.state.model ? `${event.state.model.provider}/${event.state.model.id}` : null;
+			currentModelKey = modelKey(event.state.model);
+			currentSessionId = event.state.sessionId || currentSessionId;
+			currentSessionFile = event.state.sessionFile || currentSessionFile;
+			syncSessionUrl(screenSessionHandle());
 			populateThinkingSelect(event.state.availableThinkingLevels || [], event.state.thinkingLevel);
+			updateAlert();
 			break;
 		case "session_replaced":
-			liveAssistantEl = null;
+			liveNode = null;
 			liveMessage = null;
 			applyState(event.state);
 			loadModels();
+			loadSessions();
 			break;
 		case "message_start":
 			if (event.message.role === "assistant") {
@@ -293,7 +576,13 @@ function handleEvent(event) {
 			if (e.type === "text_start" || e.type === "thinking_start" || e.type === "toolcall_start") {
 				const content = liveMessage.content;
 				while (content.length <= e.contentIndex) {
-					content.push(e.type === "thinking_start" ? { type: "thinking", thinking: "" } : e.type === "toolcall_start" ? { type: "toolCall", id: e.id, name: e.toolName, partialArguments: "" } : { type: "text", text: "" });
+					content.push(
+						e.type === "thinking_start"
+							? { type: "thinking", thinking: "" }
+							: e.type === "toolcall_start"
+								? { type: "toolCall", id: e.id, name: e.toolName, partialArguments: "" }
+								: { type: "text", text: "" },
+					);
 				}
 			} else if (e.type === "text_delta") {
 				const part = liveMessage.content[e.contentIndex];
@@ -303,32 +592,38 @@ function handleEvent(event) {
 				if (part && part.type === "thinking") part.thinking += e.delta;
 			} else if (e.type === "toolcall_delta") {
 				const part = liveMessage.content[e.contentIndex];
-				if (part && part.type === "toolCall") {
-					try {
-						part.partialArguments = (part.partialArguments || "") + e.delta;
-					} catch (_err) {
-						/* ignore malformed streaming args */
-					}
-				}
+				if (part && part.type === "toolCall") part.partialArguments = (part.partialArguments || "") + e.delta;
 			}
 			rebuildLiveBody();
 			break;
 		}
-		case "message_end":
-			if (event.message.role === "assistant" && liveAssistantEl) {
-				liveAssistantEl.replaceWith(renderMessage(event.message));
-				liveAssistantEl = null;
+		case "tool_execution_end": {
+			toolTimingById.set(event.toolCallId, { ms: event.durationMs, isError: event.isError });
+			const card = toolBlocksById.get(event.toolCallId);
+			if (card) applyToolState(card, { ms: event.durationMs, isError: event.isError });
+			break;
+		}
+		case "message_end": {
+			const msg = event.message;
+			if (msg.role === "assistant" && liveNode) {
+				const done = messageNode(msg);
+				liveNode.replaceWith(done);
+				liveNode = null;
 				liveMessage = null;
-			} else if (event.message.role !== "assistant") {
-				messagesEl.appendChild(renderMessage(event.message));
+				if (msg.usage) lastContextTokens = (msg.usage.input || 0) + (msg.usage.cacheRead || 0) + (msg.usage.cacheWrite || 0);
+				updateUsage();
+			} else {
+				appendMessage(msg);
 			}
 			scrollToBottom();
 			break;
+		}
 		case "agent_start":
 			setBusy(true);
 			break;
 		case "agent_settled":
 			setBusy(false);
+			maybeTrackNewSession();
 			refreshState().catch(() => toast("状态刷新失败", true));
 			break;
 		case "thinking_level_changed":
@@ -338,7 +633,7 @@ function handleEvent(event) {
 			$("status-line").textContent = `请求失败，第 ${event.attempt}/${event.maxAttempts} 次重试（${Math.round(event.delayMs / 1000)}s 后）：${event.errorMessage}`;
 			break;
 		case "auto_retry_end":
-			if (!event.success) toast(`重试最终失败: ${event.finalError || "未知错误"}`, true);
+			if (!event.success) reportError(`重试最终失败: ${event.finalError || "未知错误"}`);
 			break;
 		case "compaction_start":
 			$("status-line").textContent = "正在压缩上下文…";
@@ -347,19 +642,36 @@ function handleEvent(event) {
 			$("status-line").textContent = event.aborted ? "上下文压缩已中止" : "上下文压缩完成";
 			break;
 		case "web_error":
-			toast(event.message, true);
+			reportError(event.message);
 			break;
 		case "extension_error":
-			toast(`扩展错误 (${event.extensionPath}): ${event.error}`, true);
+			reportError(`扩展错误 (${event.extensionPath}): ${event.error}`);
 			break;
 		default:
 			break;
 	}
 }
 
+/** Errors need to outlive a toast: the transcript keeps a red card. */
+function reportError(message) {
+	toast(message, true);
+	const node = el("div", "msg error");
+	node.appendChild(el("div", "avatar", "!"));
+	const body = el("div", "body");
+	const bubble = el("div", "bubble");
+	bubble.appendChild(el("div", "meta", "错误"));
+	bubble.appendChild(el("div", undefined, message));
+	body.appendChild(bubble);
+	node.appendChild(body);
+	hideEmptyState();
+	messagesEl.appendChild(node);
+	scrollToBottom();
+	if (message.includes("No API key") || message.includes("available model")) loadModels();
+}
+
 function connectEvents() {
 	const dot = $("conn-dot");
-	const source = new EventSource("/api/events");
+	const source = new EventSource(withBase("/api/events"));
 	source.onopen = () => {
 		dot.className = "dot on";
 		dot.title = "已连接";
@@ -379,7 +691,7 @@ function connectEvents() {
 	};
 }
 
-// ---- top bar -----------------------------------------------------------------
+// ---- pickers -----------------------------------------------------------------
 
 let modelsPayload = null;
 
@@ -390,26 +702,32 @@ function populateModelSelect() {
 	const available = new Set(modelsPayload.available);
 	const byProvider = new Map();
 	for (const model of modelsPayload.models) {
+		if (!available.has(`${model.provider}/${model.id}`)) continue;
 		if (!byProvider.has(model.provider)) byProvider.set(model.provider, []);
 		byProvider.get(model.provider).push(model);
 	}
+	if (byProvider.size === 0) {
+		const option = document.createElement("option");
+		option.textContent = "无可用模型";
+		option.value = "";
+		select.appendChild(option);
+		select.disabled = true;
+		return;
+	}
+	select.disabled = false;
 	for (const [provider, models] of byProvider) {
 		const group = document.createElement("optgroup");
-		const auth = modelsPayload.providers[provider] && modelsPayload.providers[provider].auth;
-		group.label = `${provider}${auth && auth.configured ? "" : " (未配置)"}`;
+		group.label = provider;
 		for (const model of models) {
 			const option = document.createElement("option");
 			option.value = `${model.provider}/${model.id}`;
 			option.textContent = model.name || model.id;
-			option.disabled = !available.has(option.value);
 			group.appendChild(option);
 		}
 		select.appendChild(group);
 	}
 	if (currentModelKey) select.value = currentModelKey;
-	if (select.selectedOptions.length === 0 || select.value !== currentModelKey) {
-		select.selectedIndex = -1;
-	}
+	if (select.value !== currentModelKey) select.selectedIndex = -1;
 }
 
 function populateThinkingSelect(levels, current) {
@@ -419,7 +737,7 @@ function populateThinkingSelect(levels, current) {
 	for (const level of levels) {
 		const option = document.createElement("option");
 		option.value = level;
-		option.textContent = `thinking: ${level}`;
+		option.textContent = level;
 		select.appendChild(option);
 	}
 	if (current) select.value = current;
@@ -432,7 +750,9 @@ $("model-select").addEventListener("change", async () => {
 	try {
 		await apiPost("/api/model", { provider, modelId: rest.join("/") });
 		currentModelKey = value;
+		await loadModels();
 		await refreshState();
+		toast(`已切换模型: ${value}`);
 	} catch (error) {
 		toast(error.message, true);
 		populateModelSelect();
@@ -462,21 +782,36 @@ $("stop-btn").addEventListener("click", () => {
 
 // ---- composer ----------------------------------------------------------------
 
+function autogrow() {
+	const input = $("input");
+	input.style.height = "auto";
+	input.style.height = `${Math.min(input.scrollHeight, window.innerHeight * 0.4)}px`;
+}
+
 async function sendMessage() {
 	const input = $("input");
 	const text = input.value.trim();
 	if (!text) return;
+	if (!hasUsableModel()) {
+		toast("请先配置模型并在顶部选择", true);
+		openSettings();
+		return;
+	}
 	input.value = "";
+	autogrow();
 	try {
 		const result = await apiPost("/api/prompt", { text });
 		if (result.disposition === "queued") toast("已排队（steer）");
 	} catch (error) {
 		toast(error.message, true);
 		input.value = text;
+		autogrow();
+		if (error.message.includes("可用模型")) openSettings();
 	}
 }
 
 $("send-btn").addEventListener("click", sendMessage);
+$("input").addEventListener("input", autogrow);
 $("input").addEventListener("keydown", (event) => {
 	if (event.key === "Enter" && !event.shiftKey) {
 		event.preventDefault();
@@ -484,34 +819,185 @@ $("input").addEventListener("keydown", (event) => {
 	}
 });
 
-$("banner-close").addEventListener("click", () => {
-	$("security-banner").hidden = true;
+// ---- session sidebar --------------------------------------------------------
+
+let sessionsPayload = null; // { sessions, sessionDir, currentSessionId }
+let sessionsError = "";
+let currentSessionId = null; // session on screen, from the latest state
+let currentSessionFile = null; // its file, null while the session is not persisted yet
+let currentSessionName = null;
+let urlSessionId = new URLSearchParams(window.location.search).get("session"); // session in the address bar
+let pendingUrlPush = false; // the next session change gets its own history entry
+
+/**
+ * Only a saved session has a URL: an unsaved one (no message yet, or `--no-session`) cannot be
+ * resumed, so putting its id in the address bar would create a dead bookmark and a dead history
+ * entry.
+ */
+function screenSessionHandle() {
+	return currentSessionFile ? currentSessionId : null;
+}
+
+/**
+ * Mirror the open session in the address bar (`/fly_pi/?session=<id>`), so a session can be
+ * bookmarked, reloaded, and reached with the back/forward buttons. The session goes in the query
+ * string and not in a path segment because the page's assets are relative URLs. `pendingUrlPush`
+ * marks the change as a user navigation, so it gets a history entry instead of replacing the
+ * current one.
+ */
+function syncSessionUrl(sessionId) {
+	const push = pendingUrlPush;
+	pendingUrlPush = false;
+	if (sessionId === urlSessionId) return;
+	urlSessionId = sessionId;
+	const query = sessionId ? `session=${encodeURIComponent(sessionId)}` : "";
+	history[push ? "pushState" : "replaceState"](null, "", `${UI_BASE}/${query ? `?${query}` : ""}`);
+}
+
+function relTime(iso) {
+	const time = Date.parse(iso);
+	if (!Number.isFinite(time)) return "";
+	const minutes = Math.max(0, Math.round((Date.now() - time) / 60000));
+	if (minutes < 1) return "刚刚";
+	if (minutes < 60) return `${minutes} 分钟前`;
+	const hours = Math.round(minutes / 60);
+	if (hours < 24) return `${hours} 小时前`;
+	const days = Math.round(hours / 24);
+	if (days < 31) return `${days} 天前`;
+	return new Date(time).toLocaleDateString("zh-CN");
+}
+
+function sessionTitle(sessionEntry) {
+	if (sessionEntry.name) return sessionEntry.name;
+	const first = (sessionEntry.firstMessage || "").replace(/\s+/g, " ").trim();
+	return first || "(空会话)";
+}
+
+function sessionRow(sessionEntry, active, clickable) {
+	const row = el(clickable ? "button" : "div", `session-row${active ? " active" : ""}`);
+	if (clickable) row.type = "button";
+	row.appendChild(el("span", "title", sessionTitle(sessionEntry)));
+	const sub = [];
+	if (sessionEntry.sub) sub.push(sessionEntry.sub);
+	else {
+		if (sessionEntry.modified) sub.push(relTime(sessionEntry.modified));
+		sub.push(`${sessionEntry.messageCount || 0} 条消息`);
+	}
+	row.appendChild(el("span", "sub", sub.join(" · ")));
+	row.title = sessionTitle(sessionEntry);
+	if (clickable) row.addEventListener("click", () => resumeSession(sessionEntry.id, true));
+	return row;
+}
+
+function renderSessionList() {
+	const list = $("session-list");
+	list.innerHTML = "";
+	if (!sessionsPayload) {
+		list.appendChild(el("div", "session-list-hint", sessionsError || "加载中…"));
+		return;
+	}
+	const { sessions, sessionDir, currentSessionId: listedCurrent } = sessionsPayload;
+	if (!sessionDir) {
+		list.appendChild(el("div", "session-list-hint", "当前会话未持久化，没有可恢复的历史会话。"));
+		return;
+	}
+	const activeId = listedCurrent || currentSessionId;
+	if (!activeId || !sessions.some((sessionEntry) => sessionEntry.id === activeId)) {
+		// A new session only gets its file on the first message: keep it pinned at the top.
+		list.appendChild(sessionRow({ name: currentSessionName || "当前会话", sub: "进行中" }, true, false));
+	}
+	for (const sessionEntry of sessions) {
+		list.appendChild(sessionRow(sessionEntry, sessionEntry.id === activeId, sessionEntry.id !== activeId));
+	}
+	if (sessions.length === 0) list.appendChild(el("div", "session-list-hint", "该目录还没有已保存的会话。"));
+}
+
+async function loadSessions() {
+	try {
+		sessionsPayload = await api("/api/sessions");
+		sessionsError = "";
+	} catch (error) {
+		sessionsPayload = null;
+		sessionsError = `会话列表加载失败：${error.message}`;
+	}
+	renderSessionList();
+}
+
+/**
+ * Switch to a session by id. `push` adds a history entry (user click); a switch triggered by the
+ * back/forward buttons or by loading a session URL only replaces the address bar.
+ */
+async function resumeSession(sessionId, push) {
+	if (!sessionId || sessionId === currentSessionId) return;
+	if (busy && !confirm("当前回合正在进行，切换会话会中止它。继续？")) {
+		syncSessionUrl(screenSessionHandle()); // undo a back/forward navigation the user did not confirm
+		return;
+	}
+	pendingUrlPush = push === true;
+	try {
+		const result = await apiPost("/api/session/resume", { sessionId });
+		if (result.cancelled) {
+			toast("切换会话被扩展取消", true);
+		} else {
+			currentSessionId = sessionId;
+			currentSessionFile = result.sessionFile || currentSessionFile;
+		}
+	} catch (error) {
+		toast(error.message, true);
+	}
+	// The `session_replaced` event usually updates the address bar first; this also covers a switch
+	// that failed, putting the session that is really on screen back into the URL.
+	syncSessionUrl(screenSessionHandle());
+}
+
+// A new or renamed session is only on disk after its first turn: pull the list once when the
+// current session is still missing from it, instead of rescanning the directory every turn.
+function maybeTrackNewSession() {
+	if (!sessionsPayload || !sessionsPayload.sessionDir) return;
+	if (currentSessionId && sessionsPayload.sessions.some((sessionEntry) => sessionEntry.id === currentSessionId)) return;
+	loadSessions();
+}
+
+$("refresh-sessions-btn").addEventListener("click", loadSessions);
+$("sidebar-toggle").addEventListener("click", () => {
+	const hidden = $("app").classList.toggle("sidebar-hidden");
+	localStorage.setItem("pi-web-sidebar-hidden", hidden ? "1" : "");
+});
+if (localStorage.getItem("pi-web-sidebar-hidden")) $("app").classList.add("sidebar-hidden");
+
+// Back/forward: the address bar already changed, so follow it with the matching session.
+window.addEventListener("popstate", () => {
+	urlSessionId = new URLSearchParams(window.location.search).get("session");
+	if (!urlSessionId) {
+		// A bare URL means the session it came from was never saved and cannot be restored, so put
+		// the session that is on screen back into the address bar instead of pointing at nothing.
+		syncSessionUrl(screenSessionHandle());
+		return;
+	}
+	resumeSession(urlSessionId, false);
 });
 
-// ---- settings drawer ----------------------------------------------------------
+// ---- settings modal -----------------------------------------------------------
 
-const drawer = $("settings-drawer");
+const modal = $("settings-modal");
 let editingProviderId = null; // null when creating a new provider
 
-$("settings-btn").addEventListener("click", () => {
-	drawer.hidden = false;
-	loadConfig();
-});
-$("settings-close").addEventListener("click", () => {
-	drawer.hidden = true;
-});
-drawer.addEventListener("click", (event) => {
-	if (event.target === drawer) drawer.hidden = true;
-});
-
-async function loadModels() {
-	try {
-		modelsPayload = await api("/api/models");
-		populateModelSelect();
-	} catch (error) {
-		toast(`加载模型失败: ${error.message}`, true);
-	}
+function openSettings() {
+	modal.hidden = false;
+	// Auth status comes from /api/models; refresh it first so the list is not stale.
+	loadModels().then(loadConfig);
 }
+
+$("settings-btn").addEventListener("click", openSettings);
+$("settings-close").addEventListener("click", () => {
+	modal.hidden = true;
+});
+modal.addEventListener("click", (event) => {
+	if (event.target === modal) modal.hidden = true;
+});
+document.addEventListener("keydown", (event) => {
+	if (event.key === "Escape" && !modal.hidden) modal.hidden = true;
+});
 
 async function loadConfig() {
 	const errorBox = $("config-error");
@@ -524,28 +1010,56 @@ async function loadConfig() {
 		return;
 	}
 	if (config.runtimeError) showConfigError(config.runtimeError);
+	const providers = config.providers || {};
+	const modelAuth = modelsPayload ? modelsPayload.providers : {};
+	const authOf = (id) => (modelAuth[id] ? modelAuth[id].auth : undefined);
+	const isConfigured = (id) => Boolean(providers[id]) || Boolean(authOf(id) && authOf(id).configured);
+	providerIndex = [...Object.keys(providers), ...Object.keys(modelAuth)]
+		.filter((id, index, all) => all.indexOf(id) === index)
+		.map((id) => ({ id, entry: providers[id], auth: authOf(id) }))
+		// models.json entries and authenticated providers first; the long tail of built-in
+		// providers is hidden by default so the one you just configured stays findable.
+		.sort((a, b) => Number(isConfigured(b.id)) - Number(isConfigured(a.id)) || a.id.localeCompare(b.id));
+	renderProviderList();
+}
+
+let providerIndex = []; // { id, entry, auth }
+let showAllProviders = false;
+
+function renderProviderList() {
 	const list = $("provider-list");
 	list.innerHTML = "";
-	const providerIds = new Set(Object.keys(config.providers || {}));
-	const modelAuth = modelsPayload ? modelsPayload.providers : {};
-	for (const id of Object.keys(modelAuth)) providerIds.add(id);
+	const filter = $("provider-filter").value.trim().toLowerCase();
+	const hidden = providerIndex.filter((item) => !item.entry && !(item.auth && item.auth.configured));
+	const visible = providerIndex.filter((item) => showAllProviders || !hidden.includes(item));
+	const matched = visible.filter((item) => !filter || item.id.toLowerCase().includes(filter) || (item.entry && item.entry.name ? item.entry.name.toLowerCase().includes(filter) : false));
 
-	for (const id of [...providerIds].sort()) {
-		const entry = (config.providers || {})[id];
-		const auth = modelAuth[id] && modelAuth[id].auth;
-		const row = el("div", "provider-row");
-		row.appendChild(el("span", "name", id));
-		if (entry && entry.name && entry.name !== id) row.appendChild(el("span", undefined, entry.name));
-		row.appendChild(el("span", "models-count", entry && entry.models ? `${entry.models.length} 个自定义模型` : "models.json 未配置"));
-		const badge = el("span", `badge ${auth && auth.configured ? "ok" : "no"}`, auth && auth.configured ? `已认证${auth.label ? ` (${auth.label})` : ""}` : "未认证");
-		row.appendChild(badge);
-		const editBtn = el("button", undefined, "编辑");
-		editBtn.addEventListener("click", () => openProviderForm(id, entry || {}));
-		row.appendChild(editBtn);
+	if (matched.length === 0) list.appendChild(el("div", "pane-hint", "无匹配 Provider"));
+	for (const item of matched) {
+		const { id, entry, auth } = item;
+		const row = el("div", `provider-row${editingProviderId === id ? " active" : ""}`);
+		row.appendChild(el("span", "name", entry && entry.name ? entry.name : id));
+		row.appendChild(el("span", `badge${auth && auth.configured ? " ok" : ""}`, auth && auth.configured ? `已认证${auth.label ? ` (${auth.label})` : ""}` : "未认证"));
+		const sub = [];
+		if (entry && entry.baseUrl) sub.push(entry.baseUrl);
+		else sub.push("内置 Provider，models.json 未覆盖");
+		if (entry && entry.models) sub.push(`${entry.models.length} 个模型`);
+		if (entry && entry.api) sub.push(entry.api);
+		row.appendChild(el("span", "sub", sub.join(" · ")));
+		row.addEventListener("click", () => openProviderForm(id, entry || {}));
 		list.appendChild(row);
 	}
-	loadModels();
+
+	const toggle = $("show-all-providers");
+	toggle.hidden = showAllProviders || hidden.length === 0;
+	toggle.textContent = `显示全部内置 Provider (${hidden.length})`;
 }
+
+$("provider-filter").addEventListener("input", renderProviderList);
+$("show-all-providers").addEventListener("click", () => {
+	showAllProviders = true;
+	renderProviderList();
+});
 
 function showConfigError(message) {
 	const box = $("config-error");
@@ -553,7 +1067,7 @@ function showConfigError(message) {
 	box.hidden = false;
 }
 
-function modelCard(model) {
+function modelCard(model, preselected) {
 	const card = el("div", "model-card");
 	const grid = el("div", "grid");
 
@@ -574,10 +1088,18 @@ function modelCard(model) {
 	const nameInput = mk("显示名称", model.name, "可选");
 	const contextInput = mk("Context Window", model.contextWindow, "128000", "number");
 	const maxTokensInput = mk("Max Tokens", model.maxTokens, "16384", "number");
-	const costInput = mk("Cost 输入/输出/缓存读/缓存写 (per 1M)", model.cost ? [model.cost.input, model.cost.output, model.cost.cacheRead, model.cost.cacheWrite].join(",") : "", "0,0,0,0");
+	const costInput = mk("Cost 输入/输出/缓存读/缓存写 (每 1M)", model.cost ? [model.cost.input, model.cost.output, model.cost.cacheRead, model.cost.cacheWrite].join(",") : "", "0,0,0,0");
 	card.appendChild(grid);
 
 	const checks = el("div", "checks");
+	const includeLabel = el("label");
+	const includeCheck = document.createElement("input");
+	includeCheck.type = "checkbox";
+	includeCheck.checked = preselected === undefined ? true : preselected;
+	includeLabel.appendChild(includeCheck);
+	includeLabel.appendChild(document.createTextNode(" 加入配置"));
+	checks.appendChild(includeLabel);
+
 	const reasoningLabel = el("label");
 	const reasoningCheck = document.createElement("input");
 	reasoningCheck.type = "checkbox";
@@ -598,13 +1120,14 @@ function modelCard(model) {
 		inputChecks.push({ modality, check });
 	}
 
-	const removeBtn = el("button", "remove danger", "移除模型");
+	const removeBtn = el("button", "remove danger", "移除");
 	removeBtn.type = "button";
 	removeBtn.addEventListener("click", () => card.remove());
 	checks.appendChild(removeBtn);
 	card.appendChild(checks);
 
 	card.collect = () => {
+		if (!includeCheck.checked) return null;
 		const entry = { id: idInput.value.trim() };
 		if (!entry.id) throw new Error("模型 ID 不能为空");
 		if (nameInput.value.trim()) entry.name = nameInput.value.trim();
@@ -625,48 +1148,132 @@ $("add-model-btn").addEventListener("click", () => {
 	$("models-list").appendChild(modelCard({}));
 });
 
+function parseFormHeaders() {
+	const headers = {};
+	for (const line of $("f-headers").value.split("\n")) {
+		const idx = line.indexOf("=");
+		if (idx > 0) headers[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
+	}
+	return headers;
+}
+
+function showProbeHint(message, kind) {
+	const hint = $("probe-hint");
+	if (!message) {
+		hint.hidden = true;
+		return;
+	}
+	hint.textContent = message;
+	hint.className = `hint-box ${kind}`;
+	hint.hidden = false;
+}
+
+$("test-provider-btn").addEventListener("click", async () => {
+	const baseUrl = $("f-baseurl").value.trim();
+	if (!baseUrl) {
+		toast("请先填写 Base URL", true);
+		return;
+	}
+	const button = $("test-provider-btn");
+	button.disabled = true;
+	button.textContent = "测试中…";
+	showProbeHint("", "");
+	try {
+		const result = await apiPost("/api/probe", {
+			baseUrl,
+			apiKey: $("f-apikey").value.trim(),
+			api: $("f-api").value,
+			headers: parseFormHeaders(),
+		});
+		const models = result.models || [];
+		if (!result.reachable) {
+			$("models-list").innerHTML = "";
+			showProbeHint(result.message || "服务器不可达", "bad");
+			return;
+		}
+		if (models.length === 0) {
+			showProbeHint(
+				result.listSupported
+					? "服务器可达，但未返回任何模型，请手动添加模型"
+					: result.message || "服务器可达，但不支持模型列表接口，请手动添加模型",
+				"warn",
+			);
+			return;
+		}
+		const chosen = new Set(
+			[...($("models-list").children)]
+				.map((card) => {
+					try {
+						return card.collect();
+					} catch (_error) {
+						return null;
+					}
+				})
+				.filter(Boolean)
+				.map((entry) => entry.id),
+		);
+		$("models-list").innerHTML = "";
+		for (const model of models) {
+			$("models-list").appendChild(modelCard({ id: model.id, name: model.name }, chosen.size > 0 ? chosen.has(model.id) : true));
+		}
+		showProbeHint(`连接成功，发现 ${models.length} 个模型。勾选的模型会随保存写入配置；上下文长度等参数请自行确认。`, "ok");
+	} catch (error) {
+		showProbeHint(`探测失败: ${error.message}`, "bad");
+	}
+	button.disabled = false;
+	button.textContent = "测试连接并拉取模型";
+});
+
 function openProviderForm(id, entry) {
 	editingProviderId = id;
 	$("form-title").textContent = `编辑 Provider: ${id}`;
 	$("provider-form").hidden = false;
+	$("form-empty").hidden = true;
 	const idInput = $("f-id");
 	idInput.value = id;
 	idInput.disabled = true;
 	$("f-name").value = entry.name || "";
 	$("f-baseurl").value = entry.baseUrl || "";
-	$("f-api").value = entry.api || "";
+	$("f-api").value = entry.api || "openai-completions";
 	$("f-apikey").value = entry.apiKey || "";
 	$("f-headers").value = Object.entries(entry.headers || {}).map(([k, v]) => `${k}=${v}`).join("\n");
 	const modelsList = $("models-list");
 	modelsList.innerHTML = "";
+	showProbeHint("", "");
 	for (const model of entry.models || []) {
 		modelsList.appendChild(modelCard(model));
 	}
 	$("form-error").hidden = true;
-	$("delete-provider-btn").style.display = entry.baseUrl || entry.models ? "" : "";
-	$("provider-form").scrollIntoView();
+	$("delete-provider-btn").hidden = !entry.baseUrl && !entry.models;
+	for (const row of $("provider-list").children) row.classList.remove("active");
+	$("provider-form").scrollIntoView({ block: "start" });
 }
 
 function closeProviderForm() {
 	$("provider-form").hidden = true;
+	$("form-empty").hidden = false;
 	editingProviderId = null;
+	for (const row of $("provider-list").children) row.classList.remove("active");
 }
 
 $("add-provider-btn").addEventListener("click", () => {
 	editingProviderId = null;
 	$("form-title").textContent = "新增 Provider";
 	$("provider-form").hidden = false;
+	$("form-empty").hidden = true;
 	const idInput = $("f-id");
 	idInput.value = "";
 	idInput.disabled = false;
 	$("f-name").value = "";
 	$("f-baseurl").value = "";
-	$("f-api").value = "";
+	$("f-api").value = "openai-completions";
 	$("f-apikey").value = "";
 	$("f-headers").value = "";
 	$("models-list").innerHTML = "";
+	showProbeHint("", "");
 	$("form-error").hidden = true;
-	$("delete-provider-btn").style.display = "none";
+	$("delete-provider-btn").hidden = true;
+	for (const row of $("provider-list").children) row.classList.remove("active");
 });
 
 $("cancel-provider-btn").addEventListener("click", closeProviderForm);
@@ -686,16 +1293,13 @@ $("provider-form").addEventListener("submit", async (event) => {
 	if ($("f-baseurl").value.trim()) config.baseUrl = $("f-baseurl").value.trim();
 	if ($("f-api").value) config.api = $("f-api").value;
 	if ($("f-apikey").value.trim()) config.apiKey = $("f-apikey").value.trim();
-	const headers = {};
-	for (const line of $("f-headers").value.split("\n")) {
-		const idx = line.indexOf("=");
-		if (idx > 0) headers[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
-	}
+	const headers = parseFormHeaders();
 	if (Object.keys(headers).length > 0) config.headers = headers;
 	try {
 		const models = [];
 		for (const card of $("models-list").children) {
-			models.push(card.collect());
+			const entry = card.collect();
+			if (entry) models.push(entry);
 		}
 		if (models.length > 0) config.models = models;
 	} catch (error) {
@@ -704,15 +1308,24 @@ $("provider-form").addEventListener("submit", async (event) => {
 		return;
 	}
 	try {
-		await api(`/api/config/providers/${encodeURIComponent(id)}`, {
+		const result = await api(`/api/config/providers/${encodeURIComponent(id)}`, {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ config }),
 		});
-		toast(`已保存 provider: ${id}`);
-		closeProviderForm();
-		drawer.hidden = true;
 		await loadModels();
+		await refreshState();
+		await loadConfig();
+		if (result.runtimeError) {
+			showConfigError(result.runtimeError);
+			toast("已保存，但模型列表仍有错误", true);
+		} else if (result.selectedModel) {
+			toast(`已保存并自动选择模型 ${result.selectedModel.provider}/${result.selectedModel.id}`);
+		} else {
+			toast(`已保存 provider: ${id}`);
+		}
+		closeProviderForm();
+		modal.hidden = true;
 	} catch (error) {
 		errorBox.textContent = error.message;
 		errorBox.hidden = false;
@@ -726,8 +1339,9 @@ $("delete-provider-btn").addEventListener("click", async () => {
 		await api(`/api/config/providers/${encodeURIComponent(id)}`, { method: "DELETE" });
 		toast(`已删除 provider: ${id}`);
 		closeProviderForm();
-		drawer.hidden = true;
 		await loadModels();
+		await refreshState();
+		await loadConfig();
 	} catch (error) {
 		toast(error.message, true);
 	}
@@ -735,6 +1349,17 @@ $("delete-provider-btn").addEventListener("click", async () => {
 
 // ---- boot ---------------------------------------------------------------------
 
-loadModels();
-refreshState().catch((error) => toast(`加载状态失败: ${error.message}`, true));
-connectEvents();
+(async function boot() {
+	connectEvents();
+	loadSessions();
+	await loadModels();
+	try {
+		await refreshState();
+	} catch (error) {
+		toast(`加载状态失败: ${error.message}`, true);
+	}
+	// A session URL (?session=<id>) opens that session instead of the one the server started with.
+	if (urlSessionId && urlSessionId !== currentSessionId) await resumeSession(urlSessionId, false);
+	else syncSessionUrl(screenSessionHandle());
+	$("input").focus();
+})();

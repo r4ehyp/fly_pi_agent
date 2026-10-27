@@ -4,95 +4,144 @@
 	<meta charset="utf-8" />
 	<meta name="viewport" content="width=device-width, initial-scale=1" />
 	<title>Pi Agent Web UI</title>
-	<link rel="stylesheet" href="/style.css" />
+	<link rel="stylesheet" href="style.css" />
 </head>
 <body>
 	<div id="app">
 		<header id="topbar">
-			<span class="logo">Pi</span>
-			<span id="conn-dot" class="dot off" title="连接状态"></span>
-			<select id="model-select" title="当前模型"></select>
-			<select id="thinking-select" title="思考级别"></select>
+			<span class="brand"><span class="brand-mark">pi</span><span class="brand-name">Agent</span></span>
+			<label class="picker">
+				<span class="picker-label">模型</span>
+				<select id="model-select" title="当前模型"></select>
+			</label>
+			<label class="picker">
+				<span class="picker-label">思考</span>
+				<select id="thinking-select" title="思考级别"></select>
+			</label>
+			<div id="usage" class="usage" hidden></div>
 			<div class="spacer"></div>
-			<button id="new-session-btn" type="button">新建会话</button>
-			<button id="stop-btn" type="button" disabled>停止</button>
-			<button id="settings-btn" type="button">模型设置</button>
+			<span id="conn-dot" class="dot off" title="连接状态"></span>
+			<button id="sidebar-toggle" type="button" title="显示/隐藏最近会话">会话</button>
+			<button id="new-session-btn" type="button" title="新建会话">新会话</button>
+			<button id="stop-btn" type="button" class="danger" disabled title="中止当前回合">停止</button>
+			<button id="settings-btn" type="button" class="primary">模型设置</button>
 		</header>
 
-		<div id="security-banner">
-			本服务可执行本机命令，仅监听 127.0.0.1。请勿将其暴露到公网。
-			<button id="banner-close" type="button">×</button>
+		<div id="alert-bar" hidden>
+			<span id="alert-text"></span>
+			<button id="alert-action" type="button">去配置</button>
+			<button id="alert-close" type="button" class="icon" title="忽略">×</button>
 		</div>
 
-		<main id="chat">
-			<div id="messages"></div>
-			<div id="status-line"></div>
-		</main>
+		<div id="layout">
+			<aside id="sidebar">
+				<div class="sidebar-head">
+					<span>最近会话</span>
+					<button id="refresh-sessions-btn" type="button" class="icon" title="刷新列表">⟳</button>
+				</div>
+				<div id="session-list"></div>
+				<div class="sidebar-foot">仅列出当前工作目录的会话</div>
+			</aside>
 
-		<footer id="composer">
-			<textarea id="input" rows="3" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
-			<button id="send-btn" type="button">发送</button>
-		</footer>
+			<div id="work">
+				<main id="chat">
+					<div id="messages"></div>
+					<div id="status-line"></div>
+				</main>
+
+				<footer id="composer">
+					<div id="composer-box">
+						<textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
+						<div id="composer-bar">
+							<span id="composer-hint"></span>
+							<span id="security-note" title="本服务可执行本机命令，仅监听 127.0.0.1，请勿暴露到公网。">本地模式 · 仅监听 127.0.0.1 · 可执行本机命令</span>
+							<button id="send-btn" type="button" class="primary">发送</button>
+						</div>
+					</div>
+				</footer>
+			</div>
+		</div>
 	</div>
 
-	<aside id="settings-drawer" hidden>
-		<div id="settings-panel">
-			<div class="panel-head">
+	<div id="settings-modal" class="modal" hidden>
+		<div class="modal-card">
+			<div class="modal-head">
 				<h2>模型设置</h2>
-				<button id="settings-close" type="button">×</button>
+				<p class="modal-sub">配置写入 <code>models.json</code>，保存后立即可在顶部选择。</p>
+				<button id="settings-close" type="button" class="icon" title="关闭">×</button>
 			</div>
 			<div id="config-error" class="error-box" hidden></div>
-			<div id="provider-list"></div>
-			<button id="add-provider-btn" type="button">+ 新增 Provider</button>
-
-			<form id="provider-form" hidden>
-				<h3 id="form-title">编辑 Provider</h3>
-				<div class="field">
-					<label for="f-id">Provider ID</label>
-					<input id="f-id" required placeholder="例如 my-provider" />
+			<div class="modal-body">
+				<div class="pane pane-list">
+					<div class="pane-head">
+						<span>Provider</span>
+						<button id="add-provider-btn" type="button">+ 新增</button>
+					</div>
+					<input id="provider-filter" placeholder="搜索 Provider" />
+					<div id="provider-list"></div>
+					<button id="show-all-providers" type="button" class="ghost">显示全部内置 Provider</button>
 				</div>
-				<div class="field">
-					<label for="f-name">显示名称</label>
-					<input id="f-name" placeholder="可选" />
+				<div class="pane pane-form">
+					<form id="provider-form" hidden>
+						<h3 id="form-title">新增 Provider</h3>
+						<div class="grid-2">
+							<div class="field">
+								<label for="f-id">Provider ID</label>
+								<input id="f-id" required placeholder="my-provider" />
+							</div>
+							<div class="field">
+								<label for="f-name">显示名称</label>
+								<input id="f-name" placeholder="可选" />
+							</div>
+						</div>
+						<div class="field">
+							<label for="f-baseurl">Base URL<span class="req">自定义模型必填</span></label>
+							<input id="f-baseurl" placeholder="https://api.example.com/v1" />
+						</div>
+						<div class="grid-2">
+							<div class="field">
+								<label for="f-api">API 协议<span class="req">自定义模型必填</span></label>
+								<select id="f-api">
+									<option value="openai-completions">openai-completions（/chat/completions）</option>
+									<option value="openai-responses">openai-responses（/responses）</option>
+									<option value="anthropic-messages">anthropic-messages</option>
+									<option value="google-generative-ai">google-generative-ai</option>
+									<option value="">（内置 Provider 可不填）</option>
+								</select>
+							</div>
+							<div class="field">
+								<label for="f-apikey">API Key</label>
+								<input id="f-apikey" placeholder="明文 key、$ENV 环境变量名、或 !命令" />
+							</div>
+						</div>
+						<div class="field">
+							<label for="f-headers">Headers（每行 key=value）</label>
+							<textarea id="f-headers" rows="2" placeholder="x-my-header=1"></textarea>
+						</div>
+						<div class="field">
+							<div class="field-head">
+								<label>模型列表</label>
+								<button id="test-provider-btn" type="button">测试连接并拉取模型</button>
+							</div>
+							<div id="probe-hint" class="hint-box" hidden></div>
+							<div id="models-list"></div>
+							<button id="add-model-btn" type="button" class="ghost">+ 手动添加模型</button>
+						</div>
+						<div id="form-error" class="error-box" hidden></div>
+						<div class="form-actions">
+							<button id="delete-provider-btn" type="button" class="danger">删除</button>
+							<div class="spacer"></div>
+							<button id="cancel-provider-btn" type="button">取消</button>
+							<button id="save-provider-btn" type="submit" class="primary">保存</button>
+						</div>
+					</form>
+					<div id="form-empty" class="pane-hint">选择左侧 Provider 进行编辑，或点击「+ 新增」添加自定义服务。</div>
 				</div>
-				<div class="field">
-					<label for="f-baseurl">Base URL</label>
-					<input id="f-baseurl" placeholder="例如 https://api.example.com/v1" />
-				</div>
-				<div class="field">
-					<label for="f-api">API</label>
-					<select id="f-api">
-						<option value="">（内置 Provider 可不填）</option>
-						<option value="openai-completions">openai-completions</option>
-						<option value="openai-responses">openai-responses</option>
-						<option value="anthropic-messages">anthropic-messages</option>
-						<option value="google-generative-ai">google-generative-ai</option>
-					</select>
-				</div>
-				<div class="field">
-					<label for="f-apikey">API Key</label>
-					<input id="f-apikey" placeholder="明文 key、$ENV 环境变量名、或 !命令" />
-				</div>
-				<div class="field">
-					<label for="f-headers">Headers（每行 key=value）</label>
-					<textarea id="f-headers" rows="3" placeholder="x-my-header=1"></textarea>
-				</div>
-				<div class="field">
-					<label>模型列表</label>
-					<div id="models-list"></div>
-					<button id="add-model-btn" type="button">+ 添加模型</button>
-				</div>
-				<div id="form-error" class="error-box" hidden></div>
-				<div class="form-actions">
-					<button id="save-provider-btn" type="submit">保存</button>
-					<button id="cancel-provider-btn" type="button">取消</button>
-					<button id="delete-provider-btn" type="button" class="danger">删除</button>
-				</div>
-			</form>
+			</div>
 		</div>
-	</aside>
+	</div>
 
 	<div id="toast" hidden></div>
-	<script src="/app.js"></script>
+	<script src="app.js"></script>
 </body>
 </html>

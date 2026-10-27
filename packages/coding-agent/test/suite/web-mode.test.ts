@@ -1,7 +1,7 @@
 /**
  * Web mode (pi --mode web) endpoint tests: static UI under the /fly_pi base path, session
- * state, recent-session listing/resume, models.json provider CRUD, and the server-side tab
- * icon through the HTTP API.
+ * state, recent-session listing/resume, models.json provider CRUD, scheduled tasks, and the
+ * server-side tab icon through the HTTP API.
  */
 
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -12,6 +12,12 @@ import { afterEach, describe, expect, test } from "vitest";
 import { WEB_BASE_PATH } from "../../src/cli/args.ts";
 import type { AgentSessionRuntime } from "../../src/core/agent-session-runtime.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
+import type {
+	ScheduledTask,
+	TaskRun,
+	TaskSession,
+	TaskSessionFactory,
+} from "../../src/modes/web/scheduled-task-scheduler.ts";
 import { runWebMode } from "../../src/modes/web/web-server.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
@@ -39,9 +45,16 @@ describe("web mode", () => {
 
 	/**
 	 * Starts the server and returns its UI base (origin + "/fly_pi"), so tests append routes
-	 * the way the browser does.
+	 * the way the browser does. Task options are test seams for the scheduler.
 	 */
-	async function startServer(options: { persistedSessions?: boolean } = {}): Promise<string> {
+	async function startServer(
+		options: {
+			persistedSessions?: boolean;
+			createTaskSession?: TaskSessionFactory;
+			taskNow?: () => number;
+			taskTickIntervalMs?: number;
+		} = {},
+	): Promise<string> {
 		let manager: SessionManager | undefined;
 		if (options.persistedSessions) {
 			sessionDir = mkdtempSync(join(tmpdir(), "pi-web-sessions-"));
@@ -57,7 +70,12 @@ describe("web mode", () => {
 			newSession: async () => ({ cancelled: false }),
 			switchSession: async () => ({ cancelled: false }),
 		} as unknown as AgentSessionRuntime;
-		const server = await runWebMode(runtimeHost, { port: 0 });
+		const server = await runWebMode(runtimeHost, {
+			port: 0,
+			createTaskSession: options.createTaskSession,
+			taskNow: options.taskNow,
+			taskTickIntervalMs: options.taskTickIntervalMs ?? 20,
+		});
 		const address = server.address();
 		if (!address || typeof address === "string") throw new Error("Expected TCP server address");
 		closeServer = () =>
@@ -438,6 +456,284 @@ describe("web mode", () => {
 		expect(missing.status).toBe(400);
 		// Nothing was written, so the default icon is still in use.
 		expect((await (await fetch(`${base}/api/ui-settings`)).json()).icon.set).toBe(false);
+	});
+
+	// ---- scheduled tasks ----------------------------------------------------------
+
+	interface TaskPayload {
+		revision?: number;
+		tasks: Array<ScheduledTask & { isActive?: boolean; nextRunAt?: number }>;
+		sessionDir?: string;
+	}
+
+	async function fetchTasks(base: string): Promise<TaskPayload> {
+		return (await (await fetch(`${base}/api/tasks`)).json()) as TaskPayload;
+	}
+
+	/** Posts a task payload and returns status plus parsed body. */
+	async function postTasks(
+		base: string,
+		body: Record<string, unknown>,
+	): Promise<{ status: number; payload: TaskPayload & { error?: string; createdId?: string } }> {
+		const res = await fetch(`${base}/api/tasks`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(body),
+		});
+		return {
+			status: res.status,
+			payload: (await res.json()) as TaskPayload & { error?: string; createdId?: string },
+		};
+	}
+
+	async function waitFor<T>(read: () => Promise<T>, done: (value: T) => boolean, timeoutMs = 4000): Promise<T> {
+		const deadline = Date.now() + timeoutMs;
+		let value = await read();
+		while (!done(value)) {
+			if (Date.now() > deadline) throw new Error(`Timed out after ${timeoutMs}ms waiting for a scheduled task run`);
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			value = await read();
+		}
+		return value;
+	}
+
+	/**
+	 * Run session stub: writes a real transcript into the task's session directory so the run
+	 * record points at a session file the resume endpoint can open, without needing a model.
+	 */
+	function stubTaskSessionFactory(behavior: { error?: string; transcript?: boolean } = {}) {
+		const prompts: string[] = [];
+		const factory: TaskSessionFactory = async ({ task, run, sessionDir, model }) => {
+			prompts.push(`${task.name}|${run.trigger}|${model ? `${model.provider}/${model.id}` : "none"}`);
+			const manager = SessionManager.create(process.cwd(), sessionDir);
+			manager.appendSessionInfo(`[定时任务] ${task.name}`);
+			const hasTranscript = behavior.transcript !== false && !behavior.error;
+			if (hasTranscript) {
+				manager.appendMessage({ role: "user", content: task.prompt, timestamp: Date.now() });
+				manager.appendMessage({
+					role: "assistant",
+					content: [{ type: "text", text: `task reply to ${task.prompt}` }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "test",
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: Date.now(),
+				});
+			}
+			const messages = [
+				{ role: "user", content: task.prompt },
+				{ role: "assistant", content: [{ type: "text", text: `task reply to ${task.prompt}` }] },
+			];
+			const session: TaskSession = {
+				prompt: async (text: string) => {
+					if (behavior.error) throw new Error(behavior.error);
+					prompts.push(`prompt:${text}`);
+				},
+				waitForIdle: async () => {},
+				abort: async () => {},
+				dispose: () => {},
+				messages: messages as unknown as TaskSession["messages"],
+				sessionId: manager.getSessionId(),
+				sessionFile: hasTranscript ? manager.getSessionFile() : undefined,
+				sessionName: manager.getSessionName(),
+			};
+			return session;
+		};
+		return { prompts, factory };
+	}
+
+	test("POST /api/tasks creates a daily task and rejects an invalid schedule", async () => {
+		const base = await startServer({ persistedSessions: true });
+		const created = await postTasks(base, { prompt: "生成日报", schedule: { type: "daily", time: "09:30" } });
+		expect(created.status).toBe(200);
+		expect(created.payload.createdId).toBeTruthy();
+		const task = created.payload.tasks.find((entry) => entry.id === created.payload.createdId);
+		expect(task?.name).toBe("每天 09:30"); // default name from the schedule
+		expect(task?.enabled).toBe(true);
+		expect(task?.runs).toEqual([]);
+		// nextRunAt is epoch ms the page formats; it must be in the future and at 09:30 local.
+		expect(task?.nextRunAt).toBeGreaterThan(Date.now() - 1000);
+		const next = new Date(task!.nextRunAt!);
+		expect([next.getHours(), next.getMinutes()]).toEqual([9, 30]);
+
+		const badTime = await postTasks(base, { prompt: "x", schedule: { type: "daily", time: "25:00" } });
+		expect(badTime.status).toBe(400);
+		expect(badTime.payload.error).toContain("HH:MM");
+
+		const badType = await postTasks(base, { prompt: "x", schedule: { type: "weekly" } });
+		expect(badType.status).toBe(400);
+
+		const noPrompt = await postTasks(base, { schedule: { type: "hourly", minute: 5 } });
+		expect(noPrompt.status).toBe(400);
+
+		// Only the two valid calls above were rejected before the store was touched.
+		const listed = await fetchTasks(base);
+		expect(listed.tasks).toHaveLength(1);
+		// Tasks persist next to models.json, so a restart keeps the schedule.
+		const stored = JSON.parse(readFileSync(join(harness!.tempDir, "scheduled-tasks.json"), "utf-8")) as TaskPayload;
+		expect(stored.tasks).toHaveLength(1);
+	});
+
+	test("PUT and DELETE address a task by id", async () => {
+		const base = await startServer({ persistedSessions: true });
+		const created = await postTasks(base, { prompt: "备份", schedule: { type: "hourly", minute: 15 } });
+		const id = created.payload.createdId!;
+
+		const updated = await fetch(`${base}/api/tasks/${id}`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ enabled: false, name: "夜间备份" }),
+		});
+		expect(updated.status).toBe(200);
+		const afterUpdate = ((await updated.json()) as TaskPayload).tasks.find((entry) => entry.id === id);
+		expect(afterUpdate?.name).toBe("夜间备份");
+		expect(afterUpdate?.enabled).toBe(false);
+		expect(afterUpdate?.nextRunAt).toBeUndefined(); // disabled tasks have no next fire
+
+		const unknown = await fetch(`${base}/api/tasks/does-not-exist`, { method: "DELETE" });
+		expect(unknown.status).toBe(404);
+
+		const removed = await fetch(`${base}/api/tasks/${id}`, { method: "DELETE" });
+		expect(removed.status).toBe(200);
+		expect(((await removed.json()) as TaskPayload).tasks).toHaveLength(0);
+	});
+
+	test("a due task runs on the server clock and leaves a resumable chat transcript", async () => {
+		// Fixed clock inside the 09:30 minute: the tick must fire exactly once for that minute
+		// even though the interval runs many times, which is what a closed page cannot fix.
+		let clock = new Date(2026, 9, 27, 9, 30, 10).getTime();
+		const stub = stubTaskSessionFactory();
+		const base = await startServer({
+			persistedSessions: true,
+			taskNow: () => clock,
+			createTaskSession: stub.factory,
+			taskTickIntervalMs: 10,
+		});
+		const created = await postTasks(base, { prompt: "生成日报", schedule: { type: "daily", time: "09:30" } });
+		const id = created.payload.createdId!;
+
+		const payload = await waitFor(
+			() => fetchTasks(base),
+			(value) => {
+				const runs = value.tasks.find((entry) => entry.id === id)?.runs ?? [];
+				return runs.length === 1 && runs[0].status !== "running";
+			},
+		);
+		const run = payload.tasks.find((entry) => entry.id === id)!.runs[0] as TaskRun;
+		expect(run.status).toBe("ok");
+		expect(run.trigger).toBe("schedule");
+		expect(run.prompt).toBe("生成日报");
+		expect(run.hasTranscript).toBe(true);
+		expect(run.summary).toBe("task reply to 生成日报");
+		expect(payload.revision!).toBeGreaterThan(created.payload.revision!);
+		expect(stub.prompts).toContain(`prompt:生成日报`);
+
+		// The transcript is an ordinary session: it is listed, and resume-by-id finds it.
+		const listed = (await (await fetch(`${base}/api/sessions`)).json()) as {
+			sessions: Array<{ id: string; name?: string; firstMessage: string }>;
+		};
+		const transcript = listed.sessions.find((entry) => entry.id === run.sessionId);
+		expect(transcript?.firstMessage).toBe("生成日报");
+		expect(transcript?.name).toBe("[定时任务] 每天 09:30");
+
+		const resumed = await fetch(`${base}/api/session/resume`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ sessionId: run.sessionId }),
+		});
+		expect(resumed.status).toBe(200);
+
+		// More ticks in the same minute must not fire again, and after the minute rolls over the
+		// daily task is not due until tomorrow.
+		clock += 45_000;
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		expect((await fetchTasks(base)).tasks.find((entry) => entry.id === id)!.runs).toHaveLength(1);
+		clock += 60_000;
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		expect((await fetchTasks(base)).tasks.find((entry) => entry.id === id)!.runs).toHaveLength(1);
+	});
+
+	test("disabled tasks never fire, and POST /run executes one immediately", async () => {
+		const clock = new Date(2026, 9, 27, 9, 30, 10).getTime();
+		const stub = stubTaskSessionFactory();
+		const base = await startServer({
+			persistedSessions: true,
+			taskNow: () => clock,
+			createTaskSession: stub.factory,
+			taskTickIntervalMs: 10,
+		});
+		const created = await postTasks(base, {
+			prompt: "清理",
+			schedule: { type: "hourly", minute: 30 },
+			enabled: false,
+		});
+		const id = created.payload.createdId!;
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		expect((await fetchTasks(base)).tasks.find((entry) => entry.id === id)!.runs).toHaveLength(0);
+
+		const unknown = await fetch(`${base}/api/tasks/nope/run`, { method: "POST" });
+		expect(unknown.status).toBe(404);
+
+		const run = await fetch(`${base}/api/tasks/${id}/run`, { method: "POST" });
+		expect(run.status).toBe(202);
+		const payload = await waitFor(
+			() => fetchTasks(base),
+			(value) => {
+				const runs = value.tasks.find((entry) => entry.id === id)?.runs ?? [];
+				return runs.length === 1 && runs[0].status !== "running";
+			},
+		);
+		expect(payload.tasks.find((entry) => entry.id === id)!.runs[0].trigger).toBe("manual");
+
+		// A record can be dropped without deleting the transcript.
+		const runId = payload.tasks.find((entry) => entry.id === id)!.runs[0].id;
+		const deleted = await fetch(`${base}/api/tasks/${id}/runs/${runId}`, { method: "DELETE" });
+		expect(deleted.status).toBe(200);
+		expect((await fetchTasks(base)).tasks.find((entry) => entry.id === id)!.runs).toHaveLength(0);
+		expect((await fetch(`${base}/api/tasks/nope/runs/x`, { method: "DELETE" })).status).toBe(404);
+	});
+
+	test("a failing run is recorded with its error and does not stop later schedules", async () => {
+		let clock = new Date(2026, 9, 27, 9, 30, 10).getTime();
+		const stub = stubTaskSessionFactory({ error: "No API key found for the selected model" });
+		const base = await startServer({
+			persistedSessions: true,
+			taskNow: () => clock,
+			createTaskSession: stub.factory,
+			taskTickIntervalMs: 10,
+		});
+		const created = await postTasks(base, { prompt: "日报", schedule: { type: "hourly", minute: 30 } });
+		const id = created.payload.createdId!;
+
+		const failed = await waitFor(
+			() => fetchTasks(base),
+			(value) => {
+				const runs = value.tasks.find((entry) => entry.id === id)?.runs ?? [];
+				return runs.length === 1 && runs[0].status === "error";
+			},
+		);
+		const run = failed.tasks.find((entry) => entry.id === id)!.runs[0];
+		expect(run.error).toContain("No API key");
+		// The id is recorded, but nothing reached disk: the UI must not offer to open it.
+		expect(run.sessionId).toBeTruthy();
+		expect(run.hasTranscript).toBe(false);
+		expect((await fetchTasks(base)).tasks.find((entry) => entry.id === id)!.enabled).toBe(true);
+
+		// Next hour the task is due again and runs.
+		clock += 3_600_000;
+		const next = await waitFor(
+			() => fetchTasks(base),
+			(value) => (value.tasks.find((e) => e.id === id)?.runs ?? []).length === 2,
+		);
+		expect(next.tasks.find((entry) => entry.id === id)!.runs[1].status).toBe("error"); // same stub still fails
 	});
 
 	test("unknown routes return 404", async () => {

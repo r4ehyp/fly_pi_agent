@@ -12,6 +12,20 @@ foreach ($arg in $args) {
 	}
 }
 
+# Shortcut: a bare `web` argument starts the web UI (same as --mode web).
+# A `web` that is the value of --mode is left untouched.
+$finalArgs = New-Object System.Collections.Generic.List[string]
+$prevArg = ""
+foreach ($arg in $forwardArgs) {
+	if ($arg -eq "web" -and $prevArg -ne "--mode") {
+		$finalArgs.Add("--mode")
+		$finalArgs.Add("web")
+	} else {
+		$finalArgs.Add($arg)
+	}
+	$prevArg = $arg
+}
+
 if ($noEnv) {
 	$envVarsToUnset = @(
 		"ANTHROPIC_API_KEY",
@@ -61,7 +75,7 @@ if ($noEnv) {
 # --import takes a module specifier, so pass the resolver as a file URL (Windows paths are not specifiers).
 $resolverUrl = ([System.Uri](Join-Path $scriptDir "packages/coding-agent/src/experimental/source-resolver.ts")).AbsoluteUri
 $cliPath = Join-Path $scriptDir "packages/coding-agent/src/cli.ts"
-& node --import $resolverUrl $cliPath @forwardArgs
+& node --import $resolverUrl $cliPath @finalArgs
 $exitCode = $LASTEXITCODE
 if ($exitCode -ne 0) {
 	exit $exitCode

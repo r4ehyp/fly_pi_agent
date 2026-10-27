@@ -11,6 +11,10 @@
  *   (by session id), GET /api/sessions, GET /api/models
  * - Model configuration: GET/PUT/DELETE /api/config/providers[/:id], backed by models.json;
  *   POST /api/probe tests a provider's reachability and lists its models before saving
+ * - Scheduled tasks: GET/POST /api/tasks, PUT/DELETE /api/tasks/:id, POST /api/tasks/:id/run,
+ *   POST /api/tasks/:id/abort, DELETE /api/tasks/:id/runs/:runId, backed by scheduled-tasks.json.
+ *   Runs execute in their own session on the server clock (page closed is fine) and their
+ *   transcripts are ordinary sessions the chat view opens with /api/session/resume.
  * - Appearance: GET /api/ui-settings, PUT/DELETE /api/ui-settings/icon, GET /icon, backed by
  *   web-ui.json. The icon is stored on the server so every browser hitting this instance gets
  *   the same tab icon; the page theme stays client-side (localStorage).
@@ -27,14 +31,31 @@ import { isValidThinkingLevel, WEB_BASE_PATH } from "../../cli/args.ts";
 import { getWebUiAssetsDir } from "../../config.ts";
 import type { AgentSessionEvent } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
+import { createAgentSessionFromServices } from "../../core/agent-session-services.ts";
 import { ModelConfig, saveModelsConfig } from "../../core/model-config.ts";
 import { resolveConfigValueUncached } from "../../core/resolve-config-value.ts";
 import { type SessionInfo, SessionManager } from "../../core/session-manager.ts";
 import { toJsonEvent } from "../json-event.ts";
+import {
+	formatLocalTime,
+	type ScheduledTask,
+	TASK_TICK_INTERVAL_MS,
+	TaskScheduler,
+	type TaskSessionFactory,
+} from "./scheduled-task-scheduler.ts";
 
 export interface RunWebModeOptions {
 	/** HTTP port to listen on (127.0.0.1 only). Pass 0 for an ephemeral port (tests). */
 	port: number;
+	/**
+	 * Test/embedder seam: how a scheduled task run obtains its session. Defaults to creating a
+	 * fresh persisted session from this runtime's services.
+	 */
+	createTaskSession?: TaskSessionFactory;
+	/** Test seam: clock used when deciding which tasks are due. */
+	taskNow?: () => number;
+	/** Test seam: how often the scheduler checks for due tasks. */
+	taskTickIntervalMs?: number;
 }
 
 interface SSEClient {
@@ -323,6 +344,44 @@ function sendAsset(res: http.ServerResponse, file: string, contentType: string):
 	res.end(readFileSync(assetPath, "utf-8"));
 }
 
+/** Session title for one run, so the transcript reads as a task record in the chat sidebar. */
+function taskRunSessionName(task: ScheduledTask, startedAt: string): string {
+	const firedAt = Date.parse(startedAt);
+	return `[定时任务] ${task.name} · ${formatLocalTime(Number.isFinite(firedAt) ? firedAt : Date.now())}`;
+}
+
+/**
+ * The default run factory: a brand-new persisted session in this instance's session directory,
+ * named after the task, so a finished run is an ordinary chat the sidebar and
+ * `/api/session/resume` already handle. cwd-bound services (model registry, settings, loaded
+ * resources) are shared with the runtime; the session is not, which is what keeps a background
+ * run out of the conversation on screen and lets it be aborted on its own.
+ */
+function createRuntimeTaskSession(runtime: AgentSessionRuntime): TaskSessionFactory {
+	return async ({ task, run, sessionDir, model: modelRef, thinkingLevel }) => {
+		const sessionManager = SessionManager.create(runtime.session.sessionManager.getCwd(), sessionDir);
+		sessionManager.appendSessionInfo(taskRunSessionName(task, run.startedAt));
+		if (!modelRef) {
+			throw new Error(
+				"当前没有可用模型，定时任务无法执行。请在「模型设置」中配置 Provider 并保存，或在顶部选择一个模型。",
+			);
+		}
+		const model = runtime.session.modelRuntime.getModel(modelRef.provider, modelRef.id);
+		if (!model) {
+			throw new Error(
+				`模型不可用：${modelRef.provider}/${modelRef.id}。请在「模型设置」中确认它已配置且可认证，或将任务改为跟随界面模型。`,
+			);
+		}
+		const { session } = await createAgentSessionFromServices({
+			services: runtime.services,
+			sessionManager,
+			model,
+			thinkingLevel,
+		});
+		return session;
+	};
+}
+
 /**
  * Run the web mode. Resolves once the server is listening; the listening server handle
  * keeps the process alive. Returns the server so embedders/tests can close it.
@@ -419,6 +478,40 @@ export async function runWebMode(runtime: AgentSessionRuntime, options: RunWebMo
 	});
 
 	await rebindSession();
+
+	// Scheduled tasks live in the server process, not in the page: a browser `setInterval` stops
+	// when the tab closes, and these schedules have to keep firing. Every change is broadcast so
+	// an open page updates without polling; a closed page misses nothing.
+	const scheduler = new TaskScheduler({
+		storePath: join(runtime.services.agentDir, "scheduled-tasks.json"),
+		// Read per run: /new and /resume can move the chat session to another directory.
+		getSessionDir: () => runtime.session.sessionManager.getSessionDir(),
+		createSession: options.createTaskSession ?? createRuntimeTaskSession(runtime),
+		// A task without a pinned model follows the UI's selection, but only if that selection is
+		// actually usable: after a config error the session can still be sitting on the "unknown"
+		// placeholder, and a timer must then run a real model instead of failing every fire.
+		getDefaultModel: () => {
+			const current = runtime.session.model;
+			const available = runtime.session.modelRuntime.getAvailableSnapshot();
+			const usable = available.find(
+				(model) => current && model.provider === current.provider && model.id === current.id,
+			);
+			const picked = usable ?? available[0];
+			return picked ? { provider: picked.provider, id: picked.id } : undefined;
+		},
+		onChanged: () => broadcast({ type: "tasks_changed", ...scheduler.describe() }),
+		now: options.taskNow,
+	});
+
+	/**
+	 * Task list plus whether runs can be persisted here. An in-memory instance (`--no-session`)
+	 * has no session directory, so a run could not leave a transcript: the UI says so up front
+	 * instead of letting a task silently produce nothing. The snapshot revision travels with it so
+	 * the page can ignore a response that is older than the event it already applied.
+	 */
+	const taskListPayload = (): Record<string, unknown> => {
+		return { ...scheduler.describe(), sessionDir: runtime.session.sessionManager.getSessionDir() };
+	};
 
 	const loadModelsConfigOrThrow = async (): Promise<{ providers: Record<string, unknown> }> => {
 		const config = await ModelConfig.load(modelsPath);
@@ -675,6 +768,78 @@ export async function runWebMode(runtime: AgentSessionRuntime, options: RunWebMo
 			return;
 		}
 
+		// ---- scheduled tasks -----------------------------------------------------
+		// Every response carries the full task list (with run records), so the page can render one
+		// request per action instead of re-fetching after the broadcast lands.
+		if (path === "/api/tasks" && (method === "GET" || method === "POST")) {
+			if (method === "GET") {
+				sendJson(res, 200, taskListPayload());
+				return;
+			}
+			const body = await readJsonBody(req, res);
+			if (body === undefined) return;
+			const created = scheduler.create(body);
+			if (created.error || !created.task) {
+				sendError(res, 400, created.error ?? "任务创建失败");
+				return;
+			}
+			sendJson(res, 200, { ...taskListPayload(), createdId: created.task.id });
+			return;
+		}
+
+		const taskMatch = path.match(/^\/api\/tasks\/([^/]+)$/);
+		if (taskMatch && (method === "PUT" || method === "DELETE")) {
+			const taskId = decodeURIComponent(taskMatch[1]);
+			if (method === "DELETE") {
+				const removed = scheduler.remove(taskId);
+				if (!removed.removed) {
+					sendError(res, 404, `未找到定时任务: ${taskId}`);
+					return;
+				}
+				sendJson(res, 200, taskListPayload());
+				return;
+			}
+			const body = await readJsonBody(req, res);
+			if (body === undefined) return;
+			const updated = scheduler.update(taskId, body);
+			if (updated.error) {
+				sendError(res, updated.task === undefined ? 404 : 400, updated.error);
+				return;
+			}
+			sendJson(res, 200, taskListPayload());
+			return;
+		}
+
+		const taskActionMatch = path.match(/^\/api\/tasks\/([^/]+)\/(run|abort)$/);
+		if (taskActionMatch && method === "POST") {
+			const taskId = decodeURIComponent(taskActionMatch[1]);
+			if (taskActionMatch[2] === "abort") {
+				const aborted = await scheduler.abort(taskId);
+				sendJson(res, 200, { aborted, ...taskListPayload() });
+				return;
+			}
+			// Manual runs bypass the schedule and the enabled flag: the point of the button is to
+			// test a task now. 202 because the transcript is not finished when this returns.
+			const started = scheduler.runNow(taskId);
+			if (!started.started) {
+				sendError(res, started.error?.includes("未找到") ? 404 : 409, started.error ?? "任务未能启动");
+				return;
+			}
+			sendJson(res, 202, { started: true, ...taskListPayload() });
+			return;
+		}
+
+		const taskRunMatch = path.match(/^\/api\/tasks\/([^/]+)\/runs\/([^/]+)$/);
+		if (taskRunMatch && method === "DELETE") {
+			const removed = scheduler.deleteRun(decodeURIComponent(taskRunMatch[1]), decodeURIComponent(taskRunMatch[2]));
+			if (!removed.removed) {
+				sendError(res, 404, "未找到该执行记录");
+				return;
+			}
+			sendJson(res, 200, taskListPayload());
+			return;
+		}
+
 		if (method === "POST" && path.startsWith("/api/")) {
 			const body = await readJsonBody(req, res);
 			if (body === undefined) return;
@@ -828,6 +993,10 @@ export async function runWebMode(runtime: AgentSessionRuntime, options: RunWebMo
 	}, HEARTBEAT_INTERVAL_MS);
 	heartbeat.unref();
 	server.on("close", () => clearInterval(heartbeat));
+
+	const taskTick = setInterval(() => scheduler.tick(), options.taskTickIntervalMs ?? TASK_TICK_INTERVAL_MS);
+	taskTick.unref();
+	server.on("close", () => clearInterval(taskTick));
 
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);

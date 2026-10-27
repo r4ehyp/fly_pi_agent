@@ -25,6 +25,7 @@
 			<button id="sidebar-toggle" type="button" title="显示/隐藏最近会话">会话</button>
 			<button id="new-session-btn" type="button" title="新建会话">新会话</button>
 			<button id="stop-btn" type="button" class="danger" disabled title="中止当前回合">停止</button>
+			<button id="tasks-btn" type="button" title="定时任务：按计划在本机自动执行">定时任务</button>
 			<button id="appearance-btn" type="button" title="主题与网页图标">界面设置</button>
 			<button id="settings-btn" type="button" class="primary">模型设置</button>
 		</header>
@@ -147,6 +148,80 @@
 						</div>
 					</form>
 					<div id="form-empty" class="pane-hint">选择左侧 Provider 进行编辑，或点击「+ 新增」添加自定义服务。</div>
+				</div>
+			</div>
+		</div>
+	</div>
+
+	<div id="tasks-modal" class="modal" hidden>
+		<div class="modal-card">
+			<div class="modal-head">
+				<h2>定时任务</h2>
+				<p class="modal-sub">任务由本机服务端计时执行，<strong>关闭页面不影响</strong>；每次执行都会生成一份可查看的聊天记录。</p>
+				<button id="tasks-close" type="button" class="icon" title="关闭">×</button>
+			</div>
+			<div id="tasks-note" class="hint-box" hidden></div>
+			<div class="modal-body">
+				<div class="pane pane-list">
+					<div class="pane-head">
+						<span>任务</span>
+						<button id="add-task-btn" type="button">+ 新增</button>
+					</div>
+					<div id="task-list"></div>
+				</div>
+				<div class="pane pane-form">
+					<form id="task-form" hidden>
+						<h3 id="task-form-title">新增定时任务</h3>
+						<div class="grid-2">
+							<div class="field">
+								<label for="tf-name">任务名称</label>
+								<input id="tf-name" placeholder="可选；新建时留空则按执行时间命名" />
+							</div>
+							<div class="field">
+								<label for="tf-schedule">执行方式</label>
+								<select id="tf-schedule">
+									<option value="daily">每天几点几分</option>
+									<option value="hourly">每小时几分</option>
+								</select>
+							</div>
+						</div>
+						<div class="grid-2">
+							<div class="field" id="tf-time-field">
+								<label for="tf-time">执行时间（服务器本地时间）</label>
+								<input id="tf-time" type="time" value="09:00" step="60" />
+							</div>
+							<div class="field" id="tf-minute-field" hidden>
+								<label for="tf-minute">每小时第几分钟（0-59）</label>
+								<input id="tf-minute" type="number" min="0" max="59" step="1" value="0" />
+							</div>
+							<div class="field">
+								<label for="tf-model">执行模型</label>
+								<select id="tf-model"></select>
+							</div>
+						</div>
+						<div class="field">
+							<label for="tf-prompt">执行内容（发给 Agent 的指令）</label>
+							<textarea id="tf-prompt" rows="5" placeholder="例如：汇总今天的工作目录变更并生成一份中文日报"></textarea>
+						</div>
+						<div id="task-form-error" class="error-box" hidden></div>
+						<div class="form-actions">
+							<button id="delete-task-btn" type="button" class="danger" hidden>删除</button>
+							<div class="spacer"></div>
+							<button id="abort-task-btn" type="button" class="danger" hidden>中止本次执行</button>
+							<button id="toggle-task-btn" type="button" hidden>停用</button>
+							<button id="run-task-btn" type="button" hidden>立即执行一次</button>
+							<button id="cancel-task-btn" type="button">取消</button>
+							<button id="save-task-btn" type="submit" class="primary">保存</button>
+						</div>
+					</form>
+					<div id="task-runs-section" hidden>
+						<div class="pane-head">
+							<span>执行记录</span>
+							<span id="task-runs-hint" class="sub"></span>
+						</div>
+						<div id="task-runs"></div>
+					</div>
+					<div id="task-form-empty" class="pane-hint">选择左侧任务进行编辑，或点击「+ 新增」添加定时任务。执行记录会显示在这里。</div>
 				</div>
 			</div>
 		</div>

@@ -553,6 +553,10 @@ function handleEvent(event) {
 			syncSessionUrl(screenSessionHandle());
 			populateThinkingSelect(event.state.availableThinkingLevels || [], event.state.thinkingLevel);
 			updateAlert();
+			// A (re)connect means a possibly restarted server whose revisions start over, so forget
+			// the old one and pull a fresh task list if the dialog is open.
+			tasksRevision = -1;
+			if (!tasksModal.hidden) loadTasks();
 			break;
 		case "session_replaced":
 			liveNode = null;
@@ -560,6 +564,10 @@ function handleEvent(event) {
 			applyState(event.state);
 			loadModels();
 			loadSessions();
+			break;
+		case "tasks_changed":
+			// The server pushes this on every task edit and on every run start/finish.
+			applyTasks(event);
 			break;
 		case "message_start":
 			if (event.message.role === "assistant") {
@@ -977,6 +985,342 @@ window.addEventListener("popstate", () => {
 	resumeSession(urlSessionId, false);
 });
 
+// ---- scheduled tasks ---------------------------------------------------------
+// The schedule runs in the server process, so this dialog is only a view over
+// GET/POST/PUT/DELETE <base>/api/tasks. It refreshes on the `tasks_changed` SSE event,
+// which the server broadcasts whenever a task is edited or a run starts/finishes.
+
+const tasksModal = $("tasks-modal");
+let tasksPayload = null; // { tasks: [...], sessionDir }
+let tasksRevision = -1; // scheduler snapshot revision, used to drop stale payloads
+let editingTaskId = null; // null while creating a new task
+const seenFinishedRuns = new Set(); // run ids already pulled into the chat sidebar
+
+/**
+ * Apply a task snapshot (from GET, from an action response, or from the tasks_changed event).
+ * The server stamps every snapshot with a growing revision: the run started by 「立即执行一次」
+ * often finishes while that POST is still in flight, so its (older) body must not overwrite the
+ * newer event the page already rendered.
+ */
+function applyTasks(snapshot) {
+	if (!snapshot) return;
+	const revision = Number(snapshot.revision);
+	if (Number.isFinite(revision)) {
+		if (revision <= tasksRevision) return;
+		tasksRevision = revision;
+	}
+	tasksPayload = {
+		tasks: snapshot.tasks || [],
+		sessionDir: snapshot.sessionDir === undefined ? tasksPayload && tasksPayload.sessionDir : snapshot.sessionDir,
+	};
+	renderTasks();
+	// A finished run with a transcript is a new session on disk: refresh the sidebar once.
+	let addedTranscript = false;
+	for (const task of tasksPayload.tasks) {
+		for (const run of task.runs || []) {
+			if (!run.hasTranscript || seenFinishedRuns.has(`${task.id}/${run.id}`)) continue;
+			seenFinishedRuns.add(`${task.id}/${run.id}`);
+			addedTranscript = true;
+		}
+	}
+	if (addedTranscript) loadSessions();
+}
+
+async function loadTasks() {
+	try {
+		applyTasks(await api("/api/tasks"));
+	} catch (error) {
+		showTaskFormError(`定时任务加载失败：${error.message}`);
+	}
+}
+
+function taskById(id) {
+	if (!tasksPayload) return null;
+	return tasksPayload.tasks.find((task) => task.id === id) || null;
+}
+
+/** "HH:MM" for a daily schedule, "MM" for an hourly one, in the shape the form edits. */
+function taskScheduleParts(task) {
+	const schedule = task.schedule || { type: "daily", hour: 9, minute: 0 };
+	const pad = (n) => String(n).padStart(2, "0");
+	if (schedule.type === "hourly") return { type: "hourly", time: "", minute: String(schedule.minute) };
+	return { type: "daily", time: `${pad(schedule.hour)}:${pad(schedule.minute)}`, minute: "" };
+}
+
+/** "今天 09:30" / "明天 09:30" / "11月3日 09:30". */
+function fmtWhen(timestampMs) {
+	if (!Number.isFinite(timestampMs)) return "";
+	const date = new Date(timestampMs);
+	const pad = (n) => String(n).padStart(2, "0");
+	const clock = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+	const today = new Date();
+	const tomorrow = new Date(Date.now() + 86400000);
+	if (date.toDateString() === today.toDateString()) return `今天 ${clock}`;
+	if (date.toDateString() === tomorrow.toDateString()) return `明天 ${clock}`;
+	return `${date.getMonth() + 1}月${date.getDate()}日 ${clock}`;
+}
+
+function fmtDuration(ms) {
+	if (!Number.isFinite(ms)) return "";
+	if (ms < 1000) return `${Math.round(ms)}ms`;
+	const seconds = ms / 1000;
+	if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
+	return `${Math.floor(seconds / 60)}分${Math.round(seconds % 60)}秒`;
+}
+
+function runStatusText(run) {
+	if (run.status === "running") return "执行中…";
+	return run.status === "ok" ? "成功" : "失败";
+}
+
+function taskRow(task) {
+	const row = el("div", `task-row${editingTaskId === task.id ? " active" : ""}${task.enabled ? "" : " off"}`);
+	row.appendChild(el("span", "name", task.name));
+	const badge = el("span", `badge${task.enabled ? " ok" : ""}`, task.isActive ? "执行中" : task.enabled ? "已启用" : "已停用");
+	row.appendChild(badge);
+	const sub = [];
+	if (task.schedule.type === "hourly") sub.push(`每小时第 ${String(task.schedule.minute).padStart(2, "0")} 分`);
+	else sub.push(`每天 ${String(task.schedule.hour).padStart(2, "0")}:${String(task.schedule.minute).padStart(2, "0")}`);
+	if (task.enabled && task.nextRunAt) sub.push(`下次 ${fmtWhen(task.nextRunAt)}`);
+	sub.push(`${(task.runs || []).length} 条记录`);
+	if (task.model) sub.push(task.model.id);
+	row.appendChild(el("span", "sub", sub.join(" · ")));
+	row.addEventListener("click", () => openTaskForm(task.id));
+	return row;
+}
+
+function renderTaskList() {
+	const list = $("task-list");
+	list.innerHTML = "";
+	if (!tasksPayload) {
+		list.appendChild(el("div", "pane-hint", "加载中…"));
+		return;
+	}
+	if (tasksPayload.tasks.length === 0) {
+		list.appendChild(el("div", "pane-hint", "还没有定时任务，点击「+ 新增」创建一个。"));
+		return;
+	}
+	for (const task of tasksPayload.tasks) list.appendChild(taskRow(task));
+}
+
+function renderTaskRuns() {
+	const section = $("task-runs-section");
+	const box = $("task-runs");
+	const task = taskById(editingTaskId);
+	section.hidden = !task;
+	box.innerHTML = "";
+	if (!task) return;
+	const runs = [...(task.runs || [])].reverse(); // newest first: records are a log
+	$("task-runs-hint").textContent = `最近 ${Math.min(runs.length, 30)} 次（服务端保留最新 30 次）`;
+	if (runs.length === 0) box.appendChild(el("div", "pane-hint", "还没有执行记录。可点「立即执行一次」验证任务能否跑通。"));
+	for (const run of runs) box.appendChild(runRow(task, run));
+}
+
+function runRow(task, run) {
+	const row = el("div", `run-row ${run.status}`);
+	const head = el("div", "run-head");
+	head.appendChild(el("span", `run-state ${run.status}`, runStatusText(run)));
+	head.appendChild(el("span", "run-when", `${relTime(run.startedAt)} · ${new Date(run.startedAt).toLocaleString("zh-CN")}`));
+	if (run.trigger === "manual") head.appendChild(el("span", "run-tag", "手动"));
+	if (run.durationMs !== undefined) head.appendChild(el("span", "run-tag", fmtDuration(run.durationMs)));
+	const openBtn = el("button", "run-open", "查看聊天记录");
+	openBtn.type = "button";
+	// Only a run whose session file reached disk can be resumed: a failed or empty run has an id
+	// but nothing to open, and pointing at it would 404.
+	if (!run.hasTranscript) {
+		openBtn.disabled = true;
+		openBtn.title = run.status === "running" ? "执行中，完成后可查看" : "本次执行没有产生会话记录";
+	} else {
+		openBtn.title = run.sessionName || "打开本次执行生成的聊天会话";
+		openBtn.addEventListener("click", async () => {
+			tasksModal.hidden = true;
+			await resumeSession(run.sessionId, true);
+		});
+	}
+	head.appendChild(openBtn);
+	const delBtn = el("button", "icon run-del", "×");
+	delBtn.type = "button";
+	delBtn.title = "删除这条执行记录";
+	delBtn.addEventListener("click", async () => {
+		if (!confirm("删除这条执行记录？会话文件本身不会被删除。")) return;
+		await saveTaskApi(`/api/tasks/${encodeURIComponent(task.id)}/runs/${encodeURIComponent(run.id)}`, { method: "DELETE" });
+	});
+	head.appendChild(delBtn);
+	row.appendChild(head);
+	if (run.summary) row.appendChild(el("div", "run-summary", run.summary));
+	if (run.error) row.appendChild(el("div", "run-error", `错误：${run.error}`));
+	return row;
+}
+
+function renderTasks() {
+	renderTaskList();
+	renderTaskRuns();
+	const note = $("tasks-note");
+	if (tasksPayload && !tasksPayload.sessionDir) {
+		note.textContent = "当前实例以 --no-session 启动，会话不落盘：定时任务仍会按时执行，但无法保存执行记录。";
+		note.className = "hint-box warn";
+		note.hidden = false;
+	} else {
+		note.hidden = true;
+	}
+}
+
+function populateTaskModelSelect(selected) {
+	const select = $("tf-model");
+	select.innerHTML = "";
+	const follow = document.createElement("option");
+	follow.value = "";
+	follow.textContent = "跟随界面当前模型";
+	select.appendChild(follow);
+	if (!modelsPayload) return;
+	const available = new Set(modelsPayload.available);
+	for (const model of modelsPayload.models) {
+		if (!available.has(`${model.provider}/${model.id}`)) continue;
+		const option = document.createElement("option");
+		option.value = `${model.provider}/${model.id}`;
+		option.textContent = `${model.provider}/${model.id}${model.name && model.name !== model.id ? ` (${model.name})` : ""}`;
+		select.appendChild(option);
+	}
+	select.value = selected || "";
+	if (select.value !== (selected || "")) select.selectedIndex = 0;
+}
+
+function showTaskFormError(message) {
+	const box = $("task-form-error");
+	if (!message) {
+		box.hidden = true;
+		return;
+	}
+	box.textContent = message;
+	box.hidden = false;
+}
+
+function syncScheduleFields() {
+	const hourly = $("tf-schedule").value === "hourly";
+	$("tf-time-field").hidden = hourly;
+	$("tf-minute-field").hidden = !hourly;
+}
+
+async function saveTaskApi(path, options) {
+	try {
+		const payload = await api(path, { ...options, headers: { "Content-Type": "application/json" } });
+		applyTasks(payload);
+		return payload;
+	} catch (error) {
+		showTaskFormError(error.message);
+		toast(error.message, true);
+		return null;
+	}
+}
+
+function openTaskForm(taskId) {
+	editingTaskId = taskId;
+	showTaskFormError("");
+	const form = $("task-form");
+	form.hidden = false;
+	$("task-form-empty").hidden = true;
+	const task = taskId ? taskById(taskId) : null;
+	$("task-form-title").textContent = task ? `编辑任务：${task.name}` : "新增定时任务";
+	$("tf-name").value = task ? task.name : "";
+	$("tf-prompt").value = task ? task.prompt : "";
+	const parts = task ? taskScheduleParts(task) : { type: "daily", time: "09:00", minute: "0" };
+	$("tf-schedule").value = parts.type;
+	$("tf-time").value = parts.time || "09:00";
+	$("tf-minute").value = parts.minute || "0";
+	syncScheduleFields();
+	populateTaskModelSelect(task && task.model ? `${task.model.provider}/${task.model.id}` : "");
+	$("delete-task-btn").hidden = !task;
+	$("toggle-task-btn").hidden = !task;
+	$("run-task-btn").hidden = !task;
+	$("abort-task-btn").hidden = !task || !task.isActive;
+	if (task) $("toggle-task-btn").textContent = task.enabled ? "停用" : "启用";
+	renderTaskList();
+	renderTaskRuns();
+}
+
+function closeTaskForm() {
+	editingTaskId = null;
+	$("task-form").hidden = true;
+	$("task-runs-section").hidden = true;
+	$("task-form-empty").hidden = false;
+	showTaskFormError("");
+	renderTaskList();
+}
+
+$("tasks-btn").addEventListener("click", () => {
+	tasksModal.hidden = false;
+	closeTaskForm();
+	renderTasks();
+	loadTasks();
+});
+$("tasks-close").addEventListener("click", () => {
+	tasksModal.hidden = true;
+});
+tasksModal.addEventListener("click", (event) => {
+	if (event.target === tasksModal) tasksModal.hidden = true;
+});
+$("add-task-btn").addEventListener("click", () => openTaskForm(null));
+$("cancel-task-btn").addEventListener("click", closeTaskForm);
+$("tf-schedule").addEventListener("change", syncScheduleFields);
+
+$("task-form").addEventListener("submit", async (event) => {
+	event.preventDefault();
+	showTaskFormError("");
+	const type = $("tf-schedule").value;
+	const schedule = type === "hourly" ? { type, minute: Number($("tf-minute").value) } : { type, time: $("tf-time").value };
+	const body = {
+		name: $("tf-name").value.trim(),
+		prompt: $("tf-prompt").value.trim(),
+		schedule,
+		model: $("tf-model").value,
+	};
+	if (!body.name) delete body.name; // server names it after the schedule
+	const path = editingTaskId ? `/api/tasks/${encodeURIComponent(editingTaskId)}` : "/api/tasks";
+	const payload = await saveTaskApi(path, { method: editingTaskId ? "PUT" : "POST", body: JSON.stringify(body) });
+	if (!payload) return;
+	toast(editingTaskId ? "已保存定时任务" : "已创建定时任务");
+	closeTaskForm();
+});
+
+$("toggle-task-btn").addEventListener("click", async () => {
+	const task = taskById(editingTaskId);
+	if (!task) return;
+	const payload = await saveTaskApi(`/api/tasks/${encodeURIComponent(task.id)}`, {
+		method: "PUT",
+		body: JSON.stringify({ enabled: !task.enabled }),
+	});
+	if (!payload) return;
+	const updated = taskById(editingTaskId);
+	if (updated) $("toggle-task-btn").textContent = updated.enabled ? "停用" : "启用";
+	toast(updated && updated.enabled ? `已启用定时任务：${updated.name}` : `已停用定时任务：${updated ? updated.name : task.name}`);
+});
+
+$("run-task-btn").addEventListener("click", async () => {
+	const task = taskById(editingTaskId);
+	if (!task) return;
+	const button = $("run-task-btn");
+	button.disabled = true;
+	const payload = await saveTaskApi(`/api/tasks/${encodeURIComponent(task.id)}/run`, { method: "POST", body: "{}" });
+	button.disabled = false;
+	if (payload) toast("已开始执行，可在执行记录中查看进度");
+});
+
+$("abort-task-btn").addEventListener("click", async () => {
+	const task = taskById(editingTaskId);
+	if (!task) return;
+	await saveTaskApi(`/api/tasks/${encodeURIComponent(task.id)}/abort`, { method: "POST", body: "{}" });
+});
+
+$("delete-task-btn").addEventListener("click", async () => {
+	const task = taskById(editingTaskId);
+	if (!task || !confirm(`删除定时任务「${task.name}」？执行记录会一起删除。`)) return;
+	const payload = await saveTaskApi(`/api/tasks/${encodeURIComponent(task.id)}`, { method: "DELETE" });
+	if (payload) {
+		closeTaskForm();
+		toast("已删除定时任务");
+	}
+});
+
 // ---- appearance: theme + tab icon -------------------------------------------------
 
 const THEME_STORAGE_KEY = "pi-web-theme";
@@ -1187,6 +1531,7 @@ modal.addEventListener("click", (event) => {
 document.addEventListener("keydown", (event) => {
 	if (event.key !== "Escape") return;
 	if (!appearanceModal.hidden) appearanceModal.hidden = true;
+	if (!tasksModal.hidden) tasksModal.hidden = true;
 	if (!modal.hidden) modal.hidden = true;
 });
 

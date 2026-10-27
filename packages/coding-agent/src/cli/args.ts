@@ -10,7 +10,7 @@ import { getToolListError, type TuiMode } from "../core/settings-manager.ts";
 
 export type Mode = "text" | "json" | "rpc" | "web";
 
-export const DEFAULT_WEB_PORT = 3000;
+export const DEFAULT_WEB_PORT = 4695;
 
 /** URI prefix hosting the web UI (page, assets, and API) so it can share a port with other routes. */
 export const WEB_BASE_PATH = "/fly_pi";

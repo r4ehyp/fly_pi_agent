@@ -11,5 +11,6 @@ node packages/coding-agent/dist/bundle/cli.js
 
 # 直接源代码运行
 npm run fly_pi:dev -- <参数> 就能透传
-npm run fly_pi:dev --mode web
-.\fly_pi_dev.bat --mode web 
+# web UI（默认端口 4695，地址 http://127.0.0.1:4695/fly_pi/）；`web` 等价于 `--mode web`
+npm run fly_pi:dev web
+.\fly_pi_dev.bat web

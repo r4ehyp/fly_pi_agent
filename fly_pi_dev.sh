@@ -80,6 +80,19 @@ if [[ "$NO_ENV" == "true" ]]; then
   echo "Running without API keys..."
 fi
 
+# Shortcut: a bare `web` argument starts the web UI (same as --mode web).
+# A `web` that is the value of --mode is left untouched.
+FINAL_ARGS=()
+prev_raw=""
+for arg in ${ARGS[@]+"${ARGS[@]}"}; do
+  if [[ "$arg" == "web" && "$prev_raw" != "--mode" ]]; then
+    FINAL_ARGS+=("--mode" "web")
+  else
+    FINAL_ARGS+=("$arg")
+  fi
+  prev_raw="$arg"
+done
+
 # --import takes a module specifier, so pass the resolver as a file URL (raw paths break on #, ?, %).
 RESOLVER_URL="$(node -p 'require("node:url").pathToFileURL(process.argv[1]).href' "$SCRIPT_DIR/packages/coding-agent/src/experimental/source-resolver.ts")"
-node --import "$RESOLVER_URL" "$SCRIPT_DIR/packages/coding-agent/src/cli.ts" ${ARGS[@]+"${ARGS[@]}"}
+node --import "$RESOLVER_URL" "$SCRIPT_DIR/packages/coding-agent/src/cli.ts" ${FINAL_ARGS[@]+"${FINAL_ARGS[@]}"}

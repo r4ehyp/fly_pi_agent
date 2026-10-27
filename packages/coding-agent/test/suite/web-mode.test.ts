@@ -1,6 +1,7 @@
 /**
  * Web mode (pi --mode web) endpoint tests: static UI under the /fly_pi base path, session
- * state, recent-session listing/resume, and models.json provider CRUD through the HTTP API.
+ * state, recent-session listing/resume, models.json provider CRUD, and the server-side tab
+ * icon through the HTTP API.
  */
 
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -13,6 +14,10 @@ import type { AgentSessionRuntime } from "../../src/core/agent-session-runtime.t
 import { SessionManager } from "../../src/core/session-manager.ts";
 import { runWebMode } from "../../src/modes/web/web-server.ts";
 import { createHarness, type Harness } from "./harness.ts";
+
+/** Smallest valid PNG (1x1 transparent), so /icon gets bytes a browser can actually decode. */
+const TINY_PNG_DATA_URL =
+	"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 describe("web mode", () => {
 	let harness: Harness | undefined;
@@ -364,6 +369,75 @@ describe("web mode", () => {
 			body: JSON.stringify({ path: join(sessionDir!, "x.jsonl") }),
 		});
 		expect(pathOnly.status).toBe(400);
+	});
+
+	// The tab icon is a server-side setting: one upload applies to every browser hitting the instance.
+	test("GET /icon serves the bundled icon until a custom one is saved", async () => {
+		const base = await startServer();
+		const settings = (await (await fetch(`${base}/api/ui-settings`)).json()) as { icon: { set: boolean } };
+		expect(settings.icon.set).toBe(false);
+
+		const fallback = await fetch(`${base}/icon`);
+		expect(fallback.status).toBe(200);
+		expect(fallback.headers.get("content-type")).toContain("image/svg+xml");
+		expect(fallback.headers.get("cache-control")).toBe("no-store");
+	});
+
+	test("PUT /api/ui-settings/icon persists a PNG and DELETE restores the default", async () => {
+		const base = await startServer();
+		const put = await fetch(`${base}/api/ui-settings/icon`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ dataUrl: TINY_PNG_DATA_URL }),
+		});
+		expect(put.status).toBe(200);
+		const saved = (await put.json()) as { icon: { set: boolean; type: string; bytes: number } };
+		expect(saved.icon.set).toBe(true);
+		expect(saved.icon.type).toBe("image/png");
+		expect(saved.icon.bytes).toBeGreaterThan(0);
+
+		const written = JSON.parse(readFileSync(join(harness!.tempDir, "web-ui.json"), "utf-8")) as {
+			icon: { type: string; data: string };
+		};
+		expect(written.icon.type).toBe("image/png");
+		expect(written.icon.data).toBe(TINY_PNG_DATA_URL.split(",")[1]);
+
+		const served = await fetch(`${base}/icon`);
+		expect(served.headers.get("content-type")).toContain("image/png");
+		expect(Buffer.from(await served.arrayBuffer()).toString("base64")).toBe(TINY_PNG_DATA_URL.split(",")[1]);
+
+		const deleted = await fetch(`${base}/api/ui-settings/icon`, { method: "DELETE" });
+		expect(deleted.status).toBe(200);
+		expect(((await deleted.json()) as { icon: { set: boolean } }).icon.set).toBe(false);
+		const restored = await (await fetch(`${base}/icon`)).text();
+		expect(restored).toContain("<svg");
+	});
+
+	test("PUT /api/ui-settings/icon rejects non-PNG and malformed data URLs", async () => {
+		const base = await startServer();
+		const svg = await fetch(`${base}/api/ui-settings/icon`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ dataUrl: "data:image/svg+xml;base64,PHN2Zy8+" }),
+		});
+		expect(svg.status).toBe(400);
+		expect(((await svg.json()) as { error: string }).error).toContain("image/png");
+
+		const malformed = await fetch(`${base}/api/ui-settings/icon`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ dataUrl: "not-a-data-url" }),
+		});
+		expect(malformed.status).toBe(400);
+
+		const missing = await fetch(`${base}/api/ui-settings/icon`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({}),
+		});
+		expect(missing.status).toBe(400);
+		// Nothing was written, so the default icon is still in use.
+		expect((await (await fetch(`${base}/api/ui-settings`)).json()).icon.set).toBe(false);
 	});
 
 	test("unknown routes return 404", async () => {

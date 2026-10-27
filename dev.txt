@@ -10,6 +10,6 @@ npm run build:offline  # 无网络环境：复用已有的模型数据构建
 node packages/coding-agent/dist/bundle/cli.js
 
 # 直接源代码运行
-npm run pi:dev -- <参数> 就能透传
-npm run pi:dev --mode web
+npm run fly_pi:dev -- <参数> 就能透传
+npm run fly_pi:dev --mode web
 .\fly_pi_dev.bat --mode web 

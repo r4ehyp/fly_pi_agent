@@ -11,14 +11,17 @@
  *   (by session id), GET /api/sessions, GET /api/models
  * - Model configuration: GET/PUT/DELETE /api/config/providers[/:id], backed by models.json;
  *   POST /api/probe tests a provider's reachability and lists its models before saving
+ * - Appearance: GET /api/ui-settings, PUT/DELETE /api/ui-settings/icon, GET /icon, backed by
+ *   web-ui.json. The icon is stored on the server so every browser hitting this instance gets
+ *   the same tab icon; the page theme stays client-side (localStorage).
  *
  * The server binds to 127.0.0.1 only: the agent can execute local commands, so this
  * must not be exposed to the network without authentication.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import * as http from "node:http";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { URL } from "node:url";
 import { isValidThinkingLevel, WEB_BASE_PATH } from "../../cli/args.ts";
 import { getWebUiAssetsDir } from "../../config.ts";
@@ -49,7 +52,45 @@ const STATIC_FILES: Record<string, { file: string; contentType: string }> = {
 	"/index.html": { file: "index.html", contentType: "text/html; charset=utf-8" },
 	"/app.js": { file: "app.js", contentType: "text/javascript; charset=utf-8" },
 	"/style.css": { file: "style.css", contentType: "text/css; charset=utf-8" },
+	"/favicon.svg": { file: "favicon.svg", contentType: "image/svg+xml" },
 };
+
+/** Bundled tab icon, served at /icon until the user uploads a custom one. */
+const DEFAULT_ICON_FILE = "favicon.svg";
+/** Only the PNG the browser renders: anything else is rejected before it reaches disk. */
+const ICON_CONTENT_TYPE = "image/png";
+/** 256 KB of PNG is far above any 128x128 icon; it bounds what a request can write to disk. */
+const MAX_ICON_BYTES = 256 * 1024;
+
+interface WebUiIcon {
+	type: string;
+	/** base64 of the icon bytes, so the setting stays a single JSON file. */
+	data: string;
+	updatedAt: string;
+}
+
+interface WebUiSettings {
+	icon?: WebUiIcon;
+}
+
+/**
+ * Parse the `data:image/png;base64,...` the browser sends after rasterizing the picked file.
+ * Returns the icon, or an error message for the 400 response.
+ */
+function parseIconDataUrl(value: unknown): { icon?: WebUiIcon; error?: string } {
+	if (typeof value !== "string") return { error: "缺少必填字段: dataUrl" };
+	const match = /^data:([a-z0-9.+-]+\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=]*)$/i.exec(value.trim());
+	if (!match) return { error: "图标格式无效：需要 data:image/...;base64, 形式的 data URL" };
+	if (match[1].toLowerCase() !== ICON_CONTENT_TYPE) {
+		return { error: `图标格式不支持：仅接受 ${ICON_CONTENT_TYPE}` };
+	}
+	const bytes = Buffer.byteLength(match[2], "base64");
+	if (bytes === 0) return { error: "图标内容为空" };
+	if (bytes > MAX_ICON_BYTES) {
+		return { error: `图标过大：${bytes} 字节，上限 ${MAX_ICON_BYTES} 字节` };
+	}
+	return { icon: { type: ICON_CONTENT_TYPE, data: match[2], updatedAt: new Date().toISOString() } };
+}
 
 /**
  * Strip the base path from a request path. Returns the path to route, or undefined
@@ -270,15 +311,57 @@ async function readBody(req: http.IncomingMessage): Promise<string> {
 	return Buffer.concat(chunks).toString("utf-8");
 }
 
+/** Serve a file from the bundled UI asset directory. */
+function sendAsset(res: http.ServerResponse, file: string, contentType: string): void {
+	const assetPath = join(getWebUiAssetsDir(), file);
+	if (!existsSync(assetPath)) {
+		res.writeHead(500, { "Content-Type": "text/plain" });
+		res.end(`Web UI asset missing: ${assetPath}`);
+		return;
+	}
+	res.writeHead(200, { "Content-Type": contentType, "Cache-Control": "no-store" });
+	res.end(readFileSync(assetPath, "utf-8"));
+}
+
 /**
  * Run the web mode. Resolves once the server is listening; the listening server handle
  * keeps the process alive. Returns the server so embedders/tests can close it.
  */
 export async function runWebMode(runtime: AgentSessionRuntime, options: RunWebModeOptions): Promise<http.Server> {
 	const modelsPath = join(runtime.services.agentDir, "models.json");
+	const webSettingsPath = join(runtime.services.agentDir, "web-ui.json");
 	const clients = new Set<SSEClient>();
 	let session = runtime.session;
 	let unsubscribe: (() => void) | undefined;
+
+	/** Missing or unreadable web-ui.json is not worth failing the page over: use the defaults. */
+	const loadWebUiSettings = (): WebUiSettings => {
+		try {
+			const parsed = JSON.parse(readFileSync(webSettingsPath, "utf-8")) as unknown;
+			return parsed && typeof parsed === "object" ? (parsed as WebUiSettings) : {};
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+				console.warn(`Ignoring unreadable ${webSettingsPath}: ${(error as Error).message}`);
+			}
+			return {};
+		}
+	};
+
+	const saveWebUiSettings = (settings: WebUiSettings): void => {
+		mkdirSync(dirname(webSettingsPath), { recursive: true });
+		writeFileSync(webSettingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf-8");
+	};
+
+	/** Icon metadata only: the bytes are served at /icon, never through the JSON API. */
+	const describeIcon = (icon: WebUiIcon | undefined) =>
+		icon
+			? {
+					set: true,
+					type: icon.type,
+					updatedAt: icon.updatedAt,
+					bytes: Buffer.byteLength(icon.data, "base64"),
+				}
+			: { set: false };
 
 	const broadcast = (obj: unknown) => {
 		const data = `data: ${JSON.stringify(obj)}\n\n`;
@@ -559,6 +642,39 @@ export async function runWebMode(runtime: AgentSessionRuntime, options: RunWebMo
 			return;
 		}
 
+		if (method === "GET" && path === "/api/ui-settings") {
+			sendJson(res, 200, { icon: describeIcon(loadWebUiSettings().icon) });
+			return;
+		}
+
+		if (path === "/api/ui-settings/icon" && (method === "PUT" || method === "DELETE")) {
+			const settings = loadWebUiSettings();
+			if (method === "DELETE") {
+				delete settings.icon;
+			} else {
+				const body = await readJsonBody(req, res);
+				if (body === undefined) return;
+				const parsed = parseIconDataUrl(body.dataUrl);
+				if (parsed.error || !parsed.icon) {
+					sendError(res, 400, parsed.error ?? "图标无效");
+					return;
+				}
+				settings.icon = parsed.icon;
+			}
+			try {
+				saveWebUiSettings(settings);
+			} catch (error) {
+				sendError(
+					res,
+					500,
+					`无法写入 ${webSettingsPath}: ${error instanceof Error ? error.message : String(error)}`,
+				);
+				return;
+			}
+			sendJson(res, 200, { icon: describeIcon(settings.icon) });
+			return;
+		}
+
 		if (method === "POST" && path.startsWith("/api/")) {
 			const body = await readJsonBody(req, res);
 			if (body === undefined) return;
@@ -662,16 +778,21 @@ export async function runWebMode(runtime: AgentSessionRuntime, options: RunWebMo
 		}
 
 		if (method === "GET") {
-			const staticFile = STATIC_FILES[path];
-			if (staticFile) {
-				const assetPath = join(getWebUiAssetsDir(), staticFile.file);
-				if (!existsSync(assetPath)) {
-					res.writeHead(500, { "Content-Type": "text/plain" });
-					res.end(`Web UI asset missing: ${assetPath}`);
+			// The tab icon: the stored PNG if there is one, otherwise the bundled SVG. no-store
+			// because browsers cache favicons hard and the UI would otherwise keep the old icon.
+			if (path === "/icon") {
+				const icon = loadWebUiSettings().icon;
+				if (icon) {
+					res.writeHead(200, { "Content-Type": icon.type, "Cache-Control": "no-store" });
+					res.end(Buffer.from(icon.data, "base64"));
 					return;
 				}
-				res.writeHead(200, { "Content-Type": staticFile.contentType, "Cache-Control": "no-store" });
-				res.end(readFileSync(assetPath, "utf-8"));
+				sendAsset(res, DEFAULT_ICON_FILE, "image/svg+xml");
+				return;
+			}
+			const staticFile = STATIC_FILES[path];
+			if (staticFile) {
+				sendAsset(res, staticFile.file, staticFile.contentType);
 				return;
 			}
 		}

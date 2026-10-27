@@ -977,6 +977,195 @@ window.addEventListener("popstate", () => {
 	resumeSession(urlSessionId, false);
 });
 
+// ---- appearance: theme + tab icon -------------------------------------------------
+
+const THEME_STORAGE_KEY = "pi-web-theme";
+/** Square PNG the browser renders: one size is enough for a tab icon. */
+const ICON_SIZE = 128;
+
+// ids must match the `data-theme` blocks in style.css; swatches are the preview chips only.
+const THEMES = [
+	{ id: "dark-slate", name: "石墨深蓝", kind: "深色", swatches: ["#0e1116", "#1b222b", "#5b9dff", "#46c98b"] },
+	{ id: "dark-midnight", name: "午夜黑", kind: "深色", swatches: ["#06080b", "#12181f", "#2dd4bf", "#34d399"] },
+	{ id: "dark-plum", name: "紫檀", kind: "深色", swatches: ["#17111c", "#261d31", "#c084fc", "#f472b6"] },
+	{ id: "light-paper", name: "米纸", kind: "浅色", swatches: ["#f6f3ee", "#f0ebe3", "#b45309", "#15803d"] },
+	{ id: "light-sky", name: "晴空", kind: "浅色", swatches: ["#f3f6fb", "#e9eef7", "#2563eb", "#059669"] },
+	{ id: "light-mint", name: "薄荷", kind: "浅色", swatches: ["#f2f7f4", "#e6efe9", "#0d9488", "#16a34a"] },
+];
+
+function savedTheme() {
+	const stored = localStorage.getItem(THEME_STORAGE_KEY);
+	return THEMES.some((theme) => theme.id === stored) ? stored : THEMES[0].id;
+}
+
+function applyTheme(id) {
+	document.documentElement.setAttribute("data-theme", id);
+	localStorage.setItem(THEME_STORAGE_KEY, id);
+	for (const card of $("theme-grid").children) card.classList.toggle("active", card.dataset.theme === id);
+}
+
+function renderThemeGrid() {
+	const grid = $("theme-grid");
+	grid.innerHTML = "";
+	for (const theme of THEMES) {
+		const card = el("button", "theme-card");
+		card.type = "button";
+		card.dataset.theme = theme.id;
+		const swatches = el("div", "swatches");
+		for (const color of theme.swatches) {
+			const chip = el("i");
+			chip.style.background = color;
+			swatches.appendChild(chip);
+		}
+		card.appendChild(swatches);
+		const row = el("div", "row");
+		row.appendChild(el("span", "t-name", theme.name));
+		row.appendChild(el("span", "t-kind", theme.kind));
+		card.appendChild(row);
+		card.title = `切换到主题：${theme.name}`;
+		card.addEventListener("click", () => {
+			applyTheme(theme.id);
+			toast(`已切换主题：${theme.name}`);
+		});
+		grid.appendChild(card);
+	}
+}
+
+/**
+ * Icon URL, cache-busted after a change: browsers cache favicons aggressively, so a plain
+ * reload of the same URL can keep showing the old icon.
+ */
+let iconCacheBust = 0;
+
+function iconUrl() {
+	const url = withBase("/icon");
+	return iconCacheBust ? `${url}?v=${iconCacheBust}` : url;
+}
+
+function refreshIconPreview() {
+	$("icon-preview").src = iconUrl();
+	$("favicon-link").href = iconUrl();
+}
+
+async function loadUiSettings() {
+	try {
+		const settings = await api("/api/ui-settings");
+		const icon = settings.icon || {};
+		$("icon-state").textContent = icon.set ? `已保存自定义图标（${Math.round((icon.bytes || 0) / 1024)} KB）` : "当前使用内置图标";
+		$("icon-reset-btn").disabled = !icon.set;
+	} catch (error) {
+		$("icon-state").textContent = `图标状态读取失败：${error.message}`;
+	}
+}
+
+function showIconHint(message, kind) {
+	const hint = $("icon-hint");
+	if (!message) {
+		hint.hidden = true;
+		return;
+	}
+	hint.textContent = message;
+	hint.className = `hint-box appearance-note ${kind}`;
+	hint.hidden = false;
+}
+
+/**
+ * Draw the picked image onto a square canvas and return a PNG data URL. Rasterizing here keeps
+ * the server out of image decoding (it only ever stores a small PNG) and normalises ICO/SVG input.
+ */
+function rasterizeIcon(file) {
+	return new Promise((resolve, reject) => {
+		const objectUrl = URL.createObjectURL(file);
+		const image = new Image();
+		const done = (error, dataUrl) => {
+			URL.revokeObjectURL(objectUrl);
+			if (error) reject(error);
+			else resolve(dataUrl);
+		};
+		image.onload = () => {
+			// A sizeless SVG reports 0; treat it as already square so the draw does not vanish.
+			const sourceW = image.naturalWidth || ICON_SIZE;
+			const sourceH = image.naturalHeight || ICON_SIZE;
+			const canvas = document.createElement("canvas");
+			canvas.width = ICON_SIZE;
+			canvas.height = ICON_SIZE;
+			const ctx = canvas.getContext("2d");
+			if (!ctx) {
+				done(new Error("当前浏览器不支持 canvas"));
+				return;
+			}
+			const scale = Math.min(ICON_SIZE / sourceW, ICON_SIZE / sourceH);
+			const w = sourceW * scale;
+			const h = sourceH * scale;
+			ctx.drawImage(image, (ICON_SIZE - w) / 2, (ICON_SIZE - h) / 2, w, h);
+			done(undefined, canvas.toDataURL("image/png"));
+		};
+		image.onerror = () => done(new Error(`无法解码图片：${file.name}`));
+		image.src = objectUrl;
+	});
+}
+
+async function uploadIcon(file) {
+	const button = $("icon-pick-btn");
+	button.disabled = true;
+	showIconHint("正在处理图片…", "");
+	try {
+		const dataUrl = await rasterizeIcon(file);
+		const result = await api("/api/ui-settings/icon", {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ dataUrl }),
+		});
+		iconCacheBust = Date.now();
+		refreshIconPreview();
+		await loadUiSettings();
+		showIconHint(`已保存图标（${result.icon.set ? Math.round((result.icon.bytes || 0) / 1024) : 0} KB）。标签页若未立即更新，刷新一次即可。`, "ok");
+	} catch (error) {
+		showIconHint(`保存失败: ${error.message}`, "bad");
+	}
+	button.disabled = false;
+}
+
+const appearanceModal = $("appearance-modal");
+
+function openAppearance() {
+	appearanceModal.hidden = false;
+	showIconHint("", "");
+	refreshIconPreview();
+	loadUiSettings();
+}
+
+$("appearance-btn").addEventListener("click", openAppearance);
+$("appearance-close").addEventListener("click", () => {
+	appearanceModal.hidden = true;
+});
+appearanceModal.addEventListener("click", (event) => {
+	if (event.target === appearanceModal) appearanceModal.hidden = true;
+});
+$("icon-pick-btn").addEventListener("click", () => $("icon-file").click());
+$("icon-file").addEventListener("change", () => {
+	const file = $("icon-file").files[0];
+	$("icon-file").value = ""; // allow picking the same file again
+	if (file) uploadIcon(file);
+});
+$("icon-reset-btn").addEventListener("click", async () => {
+	const button = $("icon-reset-btn");
+	button.disabled = true;
+	try {
+		await api("/api/ui-settings/icon", { method: "DELETE" });
+		iconCacheBust = Date.now();
+		refreshIconPreview();
+		await loadUiSettings();
+		showIconHint("已恢复内置图标。", "ok");
+	} catch (error) {
+		showIconHint(`恢复失败: ${error.message}`, "bad");
+		button.disabled = false;
+	}
+});
+
+renderThemeGrid();
+applyTheme(savedTheme());
+
 // ---- settings modal -----------------------------------------------------------
 
 const modal = $("settings-modal");
@@ -996,7 +1185,9 @@ modal.addEventListener("click", (event) => {
 	if (event.target === modal) modal.hidden = true;
 });
 document.addEventListener("keydown", (event) => {
-	if (event.key === "Escape" && !modal.hidden) modal.hidden = true;
+	if (event.key !== "Escape") return;
+	if (!appearanceModal.hidden) appearanceModal.hidden = true;
+	if (!modal.hidden) modal.hidden = true;
 });
 
 async function loadConfig() {

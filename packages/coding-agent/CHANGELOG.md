@@ -5,6 +5,7 @@
 ### Added
 
 - Built-in web UI mode: `pi --mode web [--port <n>]` serves a browser chat interface on `127.0.0.1` with streaming responses, model/thinking-level switching, and editing provider and model configuration in `models.json` from the UI. All routes are hosted under the `/fly_pi/` path prefix, and a left sidebar lists the recent sessions of the current working directory for one-click resume; the address bar follows the open saved session (`/fly_pi/?session=<id>`) so it can be reloaded, bookmarked, and reached with the back and forward buttons
+- Web UI appearance panel: six color themes (three dark, three light) saved per browser, and a custom tab icon uploaded from the UI. The icon is resized to a 128x128 PNG and stored in `web-ui.json` in the agent directory, served at `/fly_pi/icon`, so every browser hitting the same instance gets it; `DELETE /api/ui-settings/icon` restores the built-in one.
 - Device-code login (for example GitHub Copilot) now opens the verification page and copies the code when you press Enter. Providers can turn either action off with `openBrowserOnConfirm: false` or `copyCodeOnConfirm: false` ([#9282](https://github.com/earendil-works/pi/issues/9282), [#9301](https://github.com/earendil-works/pi/pull/9301))
 
 ### Changed

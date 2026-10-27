@@ -4,26 +4,28 @@
 	<meta charset="utf-8" />
 	<meta name="viewport" content="width=device-width, initial-scale=1" />
 	<title>Pi Agent Web UI</title>
+	<link rel="icon" href="icon" id="favicon-link" />
 	<link rel="stylesheet" href="style.css" />
+	<script>
+		// Apply the saved theme before the first paint: app.js runs at the end of <body>,
+		// which would otherwise flash the default theme on every load. The icon needs no
+		// early script because it is served by the server at <base>/icon.
+		(function () {
+			var theme = localStorage.getItem("pi-web-theme");
+			if (theme) document.documentElement.setAttribute("data-theme", theme);
+		})();
+	</script>
 </head>
 <body>
 	<div id="app">
 		<header id="topbar">
 			<span class="brand"><span class="brand-mark">pi</span><span class="brand-name">Agent</span></span>
-			<label class="picker">
-				<span class="picker-label">模型</span>
-				<select id="model-select" title="当前模型"></select>
-			</label>
-			<label class="picker">
-				<span class="picker-label">思考</span>
-				<select id="thinking-select" title="思考级别"></select>
-			</label>
-			<div id="usage" class="usage" hidden></div>
 			<div class="spacer"></div>
 			<span id="conn-dot" class="dot off" title="连接状态"></span>
 			<button id="sidebar-toggle" type="button" title="显示/隐藏最近会话">会话</button>
 			<button id="new-session-btn" type="button" title="新建会话">新会话</button>
 			<button id="stop-btn" type="button" class="danger" disabled title="中止当前回合">停止</button>
+			<button id="appearance-btn" type="button" title="主题与网页图标">界面设置</button>
 			<button id="settings-btn" type="button" class="primary">模型设置</button>
 		</header>
 
@@ -53,6 +55,15 @@
 					<div id="composer-box">
 						<textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
 						<div id="composer-bar">
+							<label class="picker">
+								<span class="picker-label">模型</span>
+								<select id="model-select" title="当前模型"></select>
+							</label>
+							<label class="picker">
+								<span class="picker-label">思考</span>
+								<select id="thinking-select" title="思考级别"></select>
+							</label>
+							<div id="usage" class="usage" hidden></div>
 							<span id="composer-hint"></span>
 							<span id="security-note" title="本服务可执行本机命令，仅监听 127.0.0.1，请勿暴露到公网。">本地模式 · 仅监听 127.0.0.1 · 可执行本机命令</span>
 							<button id="send-btn" type="button" class="primary">发送</button>
@@ -136,6 +147,35 @@
 						</div>
 					</form>
 					<div id="form-empty" class="pane-hint">选择左侧 Provider 进行编辑，或点击「+ 新增」添加自定义服务。</div>
+				</div>
+			</div>
+		</div>
+	</div>
+
+	<div id="appearance-modal" class="modal" hidden>
+		<div class="modal-card card-sm">
+			<div class="modal-head">
+				<h2>界面设置</h2>
+				<p class="modal-sub">主题保存在当前浏览器；网页图标保存在服务端，所有访问者共用。</p>
+				<button id="appearance-close" type="button" class="icon" title="关闭">×</button>
+			</div>
+			<div class="modal-body single">
+				<div class="pane">
+					<div class="pane-head"><span>主题</span></div>
+					<div id="theme-grid"></div>
+
+					<div class="pane-head appearance-note"><span>网页图标（标签页标题左侧小图）</span></div>
+					<div class="icon-row">
+						<img id="icon-preview" alt="当前图标" />
+						<div class="icon-actions">
+							<input id="icon-file" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml,image/x-icon" hidden />
+							<button id="icon-pick-btn" type="button">选择图片并保存</button>
+							<button id="icon-reset-btn" type="button">恢复内置图标</button>
+							<span id="icon-state" class="icon-state"></span>
+						</div>
+					</div>
+					<div id="icon-hint" class="hint-box appearance-note" hidden></div>
+					<div class="hint-box appearance-note">支持 PNG / JPG / WebP / SVG / ICO。上传后统一缩放为 128x128 的 PNG，存到服务端配置目录（与 models.json 同级），任何浏览器访问这个服务都会看到同一图标。</div>
 				</div>
 			</div>
 		</div>

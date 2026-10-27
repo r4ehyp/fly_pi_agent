@@ -1,0 +1,15 @@
+
+# 安装依赖（本仓库安全规范：不执行生命周期脚本）
+npm install --ignore-scripts
+
+# 打包
+npm run build          # 先从网络刷新模型数据（models.dev、OpenRouter 等），再构建
+npm run build:offline  # 无网络环境：复用已有的模型数据构建
+
+# 运行
+node packages/coding-agent/dist/bundle/cli.js
+
+# 直接源代码运行
+npm run pi:dev -- <参数> 就能透传
+npm run pi:dev --mode web
+.\pi-test.bat --mode web 

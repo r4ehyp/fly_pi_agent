@@ -10,7 +10,7 @@ import {
 	type ProjectTrustStore,
 } from "./trust-manager.ts";
 
-export type AppMode = "interactive" | "print" | "json" | "rpc";
+export type AppMode = "interactive" | "print" | "json" | "rpc" | "web";
 
 export interface ResolveProjectTrustedOptions {
 	cwd: string;

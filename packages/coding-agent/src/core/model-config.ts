@@ -1,6 +1,6 @@
 /** Immutable, credential-blind models.json snapshot. */
 
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { ProviderCompatSchema } from "@earendil-works/pi-ai/providers/compat-schema";
 import {
 	ModelCostSchema,
@@ -216,4 +216,21 @@ export class ModelConfig {
 	getError(): string | undefined {
 		return this.error;
 	}
+}
+
+/**
+ * Validate and persist a models.json config.
+ * Throws with formatted schema errors before touching the file on validation failure.
+ */
+export async function saveModelsConfig(modelsJsonPath: string, config: unknown): Promise<void> {
+	if (!validateModelsConfig.Check(config)) {
+		const errors =
+			validateModelsConfig
+				.Errors(config)
+				.map((error) => `  - ${formatValidationPath(error)}: ${error.message}`)
+				.join("\n") || "Unknown schema error";
+		throw new Error(`Invalid models.json schema:\n${errors}`);
+	}
+	const path = normalizePath(modelsJsonPath);
+	await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, "utf-8");
 }

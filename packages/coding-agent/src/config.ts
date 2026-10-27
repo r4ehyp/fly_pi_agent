@@ -480,6 +480,21 @@ export function getBundledInteractiveAssetPath(name: string): string {
 	return join(getInteractiveAssetsDir(), name);
 }
 
+/**
+ * Get path to the built-in web UI assets directory.
+ * - For Bun binary: web-ui/ next to executable
+ * - For Node.js (dist/): dist/modes/web/ui/
+ * - For source (src/): src/modes/web/ui/
+ */
+export function getWebUiAssetsDir(): string {
+	if (isBunBinary) {
+		return join(getPackageDir(), "web-ui");
+	}
+	const packageDir = getPackageDir();
+	const srcOrDist = existsSync(join(packageDir, "src")) ? "src" : "dist";
+	return join(packageDir, srcOrDist, "modes", "web", "ui");
+}
+
 let quickJSWasmPath: string | undefined;
 
 /** Called by the Bun entry with the path of the QuickJS wasm file embedded in the compiled executable. */

@@ -4,6 +4,7 @@
 
 ### Added
 
+- Built-in web UI mode: `pi --mode web [--port <n>]` serves a browser chat interface on `127.0.0.1` with streaming responses, model/thinking-level switching, and editing provider and model configuration in `models.json` from the UI
 - Device-code login (for example GitHub Copilot) now opens the verification page and copies the code when you press Enter. Providers can turn either action off with `openBrowserOnConfirm: false` or `copyCodeOnConfirm: false` ([#9282](https://github.com/earendil-works/pi/issues/9282), [#9301](https://github.com/earendil-works/pi/pull/9301))
 
 ### Changed

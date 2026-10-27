@@ -8,7 +8,9 @@ import { APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, ENV_SESSION_DIR } from "../co
 import type { ExtensionFlag } from "../core/extensions/types.ts";
 import { getToolListError, type TuiMode } from "../core/settings-manager.ts";
 
-export type Mode = "text" | "json" | "rpc";
+export type Mode = "text" | "json" | "rpc" | "web";
+
+export const DEFAULT_WEB_PORT = 3000;
 
 export interface Args {
 	provider?: string;
@@ -22,6 +24,7 @@ export interface Args {
 	help?: boolean;
 	version?: boolean;
 	mode?: Mode;
+	port?: number;
 	name?: string;
 	noSession?: boolean;
 	session?: string;
@@ -96,18 +99,28 @@ export function parseArgs(args: string[]): Args {
 		} else if (arg === "--mode") {
 			const mode = args[i + 1];
 			if (mode === undefined || mode.startsWith("-")) {
-				result.diagnostics.push({ type: "error", message: "--mode requires text, json, or rpc" });
+				result.diagnostics.push({ type: "error", message: "--mode requires text, json, rpc, or web" });
 				continue;
 			}
 			i++;
-			if (mode !== "text" && mode !== "json" && mode !== "rpc") {
+			if (mode !== "text" && mode !== "json" && mode !== "rpc" && mode !== "web") {
 				result.diagnostics.push({
 					type: "error",
-					message: `Invalid mode "${mode}". Valid values: text, json, rpc`,
+					message: `Invalid mode "${mode}". Valid values: text, json, rpc, web`,
 				});
 				continue;
 			}
 			result.mode = mode;
+		} else if (arg === "--port" && i + 1 < args.length) {
+			const portValue = Number(args[++i]);
+			if (!Number.isInteger(portValue) || portValue < 1 || portValue > 65535) {
+				result.diagnostics.push({
+					type: "error",
+					message: `Invalid port "${args[i]}". Valid values: 1-65535`,
+				});
+			} else {
+				result.port = portValue;
+			}
 		} else if (arg === "--continue" || arg === "-c") {
 			result.continue = true;
 		} else if (arg === "--resume" || arg === "-r") {
@@ -303,7 +316,8 @@ ${chalk.bold("Options:")}
   --api-key <key>                API key (defaults to env vars)
   --system-prompt <text>         System prompt (default: coding assistant prompt)
   --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
-  --mode <mode>                  Output mode: text (default), json, or rpc
+  --mode <mode>                  Output mode: text (default), json, rpc, or web
+  --port <n>                     HTTP port for --mode web (default: ${DEFAULT_WEB_PORT})
   --print, -p                    Non-interactive mode: process prompt and exit
   --continue, -c                 Continue previous session
   --resume, -r                   Select a session to resume
@@ -353,6 +367,9 @@ ${chalk.bold("Examples:")}
 
   # Print an OAuth bearer token for an external client (refreshes if expired)
   ${APP_NAME} auth print-bearer-token --provider openai-codex
+
+  # Start the local web UI (served on http://127.0.0.1:3000)
+  ${APP_NAME} --mode web
 
   # Interactive mode
   ${APP_NAME}
